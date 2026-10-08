@@ -1,5 +1,6 @@
 require("dotenv").config();
 
+const { spawn } = require("node:child_process");
 const express = require("express");
 const play = require("play-dl");
 const {
@@ -11,7 +12,8 @@ const {
   GatewayIntentBits,
   PermissionFlagsBits,
   REST,
-  Routes
+  Routes,
+  StringSelectMenuBuilder
 } = require("discord.js");
 const {
   AudioPlayerStatus,
@@ -38,7 +40,22 @@ const owners = new Set(
 );
 const clients = [];
 const botStates = new Map();
+const pendingSearches = new Map();
 const ARABIC_DIGITS = "٠١٢٣٤٥٦٧٨٩";
+const MAX_QUEUE_SIZE = 100;
+const FILTER_LABELS = new Map([
+  ["8d", "8D"],
+  ["nightcore", "Nightcore"],
+  ["bassboost", "BassBoost"],
+  ["vaporwave", "Vaporwave"],
+  ["slowmode", "Slowmode"]
+]);
+let ffmpegPath = null;
+try {
+  ffmpegPath = require("ffmpeg-static");
+} catch (_) {
+  // Filters will explain that FFmpeg is unavailable; normal playback still works.
+}
 
 if (!tokens.length) {
   console.error("BOT_TOKENS is missing. Add one to ten Discord bot tokens in Railway Variables.");
@@ -67,6 +84,8 @@ const aliasGroups = {
   shuffle: ["shuffle", "sh", "خلط"],
   loop: ["loop", "repeat", "re", "r", "l", "تكرار", "كرر"],
   autoplay: ["autoplay", "ap", "تلقائي"],
+  filters: ["filters", "filter", "فلاتر", "فلتر"],
+  seek: ["seek", "sk", "قدم", "تقديم"],
   volume: ["volume", "vol", "v", "صوت", "ص"],
   playinvcall: ["playinvcall", "callplay", "تشغيلبالروم"],
   settings: ["settings", "setting", "اعدادات", "إعدادات"],
@@ -96,11 +115,16 @@ function guildState(client, guildId) {
       autoplay: false,
       connection: null,
       current: null,
+      filterProcess: null,
+      filters: new Set(),
       loop: false,
       player,
       playInVoice: true,
       queue: [],
       resource: null,
+      resourceStartSeconds: 0,
+      seekSeconds: null,
+      skipCurrent: false,
       starting: false,
       textChannel: null,
       volume: 0.5
@@ -115,13 +139,23 @@ function guildState(client, guildId) {
   return state.guilds.get(guildId);
 }
 
-function activeVoice(guildId) {
+function activeVoice(guildId, channelId = null) {
   for (const client of clients) {
     if (!client.user) continue;
     const data = botStates.get(client.user.id)?.guilds.get(guildId);
-    if (data?.connection?.joinConfig?.channelId) return { client, data };
+    const connection = data?.connection;
+    if (!connection || connection.state.status === VoiceConnectionStatus.Destroyed) continue;
+    if (!channelId || connection.joinConfig?.channelId === channelId) return { client, data };
   }
   return null;
+}
+
+function firstAvailableClient(guildId) {
+  return clients.find((client) => {
+    if (!client.user) return false;
+    const data = botStates.get(client.user.id)?.guilds.get(guildId);
+    return !data?.connection || data.connection.state.status === VoiceConnectionStatus.Destroyed;
+  });
 }
 
 function stripMention(client, text) {
@@ -136,9 +170,9 @@ function parseInput(client, message) {
   const parts = text.split(/\s+/);
   let first = parts.shift();
   let targetIndex = null;
-  const numbered = first.match(/^(\d+)([a-z]+)$/i);
+  const numbered = first.match(/^([0-9٠-٩]+)([a-z\u0600-\u06ff]+)$/i);
   if (numbered) {
-    targetIndex = Number(numbered[1]);
+    targetIndex = Number(arabicNumber(numbered[1]));
     first = numbered[2];
   }
   return {
@@ -155,12 +189,15 @@ function selected(client, message, parsed) {
   if (parsed.targetIndex !== null) return parsed.targetIndex - 1 === client.botIndex;
   if (parsed.mentioned) return true;
 
-  const active = activeVoice(message.guild.id);
-  if (!active) return client.botIndex === 0;
-  return (
-    active.client.user.id === client.user.id &&
-    message.member?.voice?.channelId === active.data.connection.joinConfig.channelId
-  );
+  const memberChannelId = message.member?.voice?.channelId;
+  const active = memberChannelId ? activeVoice(message.guild.id, memberChannelId) : null;
+  if (active) return active.client.user.id === client.user.id;
+
+  // If the user is in a different room, let an unused fleet bot take that room.
+  // This keeps the “only the bot with me replies” behavior while allowing multiple rooms.
+  const available = firstAvailableClient(message.guild.id);
+  if (available) return available.user.id === client.user.id;
+  return !memberChannelId && client.botIndex === 0;
 }
 
 function isAdministrator(message) {
@@ -244,7 +281,13 @@ async function resolveTracks(query, requester) {
   if (/^https?:\/\//i.test(value)) {
     if (/spotify\.com/i.test(value)) return spotifyTracks(value, requester);
 
-    if (play.yt_validate(value) === "playlist") {
+    let youtubeType = null;
+    try {
+      youtubeType = play.yt_validate(value);
+    } catch (_) {
+      youtubeType = null;
+    }
+    if (youtubeType === "playlist") {
       const playlist = await play.playlist_info(value);
       const videos = (await playlist.all_videos()).slice(0, 25);
       return videos.map((video) => ({
@@ -255,6 +298,10 @@ async function resolveTracks(query, requester) {
         title: video.title,
         url: video.url
       }));
+    }
+
+    if (youtubeType !== "video" && !/soundcloud\.com/i.test(value)) {
+      throw new Error("الرابط المدعوم يكون من YouTube أو SoundCloud أو Spotify.");
     }
 
     const metadata = await titleForUrl(value);
@@ -283,7 +330,33 @@ function controlRow(guildId) {
   );
 }
 
-function trackEmbed(client, _data, track, title) {
+function filterRow(guildId, selected = []) {
+  const options = [...FILTER_LABELS.entries()].map(([value, label]) => ({
+    label,
+    value,
+    default: selected.includes(value)
+  }));
+  options.push({ label: "مسح كل الفلاتر", value: "clear", description: "إيقاف المؤثرات الصوتية" });
+  return new ActionRowBuilder().addComponents(
+    new StringSelectMenuBuilder()
+      .setCustomId(`music:filters:${guildId}`)
+      .setPlaceholder("اختر فلاتر الصوت")
+      .setMinValues(1)
+      .setMaxValues(FILTER_LABELS.size)
+      .addOptions(options)
+  );
+}
+
+function filtersEmbed(data) {
+  const active = [...data.filters].map((filter) => FILTER_LABELS.get(filter)).filter(Boolean);
+  return new EmbedBuilder()
+    .setColor(0x7c3aed)
+    .setTitle("🎛️ فلاتر الصوت")
+    .setDescription(active.length ? `المفعّل الآن: **${active.join("، ")}**` : "ما فيه فلاتر مفعّلة.")
+    .setFooter({ text: "اختر أكثر من فلتر من القائمة • تطبّق على الأغنية التالية" });
+}
+
+function trackEmbed(client, data, track, title) {
   const embed = new EmbedBuilder()
     .setColor(0x7c3aed)
     .setTitle(title)
@@ -294,6 +367,11 @@ function trackEmbed(client, _data, track, title) {
       { name: "المدة", value: track.duration || "غير معروفة", inline: true }
     )
     .setFooter({ text: `${client.user.username} • Music Fleet` });
+  const duration = durationInSeconds(track.duration);
+  const position = data?.current === track ? currentPosition(data) : 0;
+  if (duration && Number.isFinite(position)) {
+    embed.addFields({ name: "التقدّم", value: `${progressBar(position, duration)}\n${formatSeconds(position)} / ${formatSeconds(duration)}` });
+  }
   if (track.thumbnail) embed.setThumbnail(track.thumbnail);
   return embed;
 }
@@ -307,15 +385,136 @@ async function sendNowPlaying(client, guildId, data, track) {
   }).catch(() => {});
 }
 
+function durationInSeconds(value) {
+  if (typeof value === "number") return value;
+  const text = String(value || "").trim();
+  if (!/^\d+(?::\d{1,2}){0,2}$/.test(text)) return 0;
+  return text.split(":").reduce((total, part) => total * 60 + Number(part), 0);
+}
+
+function formatSeconds(value) {
+  const seconds = Math.max(0, Math.floor(Number(value) || 0));
+  const hours = Math.floor(seconds / 3600);
+  const minutes = Math.floor((seconds % 3600) / 60);
+  const rest = String(seconds % 60).padStart(2, "0");
+  return hours ? `${hours}:${String(minutes).padStart(2, "0")}:${rest}` : `${minutes}:${rest}`;
+}
+
+function progressBar(position, duration) {
+  const size = 12;
+  const filled = Math.min(size, Math.max(0, Math.round((position / duration) * size)));
+  return `${"█".repeat(filled)}${"—".repeat(size - filled)}`;
+}
+
+function currentPosition(data) {
+  return (data.resourceStartSeconds || 0) + ((data.resource?.playbackDuration || 0) / 1000);
+}
+
+function killFilterProcess(data) {
+  if (data.filterProcess && !data.filterProcess.killed) data.filterProcess.kill();
+  data.filterProcess = null;
+}
+
+function filterExpression(filters) {
+  const expressions = [];
+  if (filters.has("8d")) expressions.push("apulsator=hz=0.08");
+  if (filters.has("nightcore")) expressions.push("asetrate=60000,aresample=48000,atempo=0.8");
+  if (filters.has("bassboost")) expressions.push("bass=g=8");
+  if (filters.has("vaporwave")) expressions.push("asetrate=38400,aresample=48000,atempo=1.25");
+  if (filters.has("slowmode")) expressions.push("atempo=0.8");
+  return expressions.join(",");
+}
+
+function filteredStream(source, data) {
+  if (!data.filters.size) return { stream: source.stream, type: source.type || StreamType.WebmOpus };
+  if (!ffmpegPath) throw new Error("الفلاتر تحتاج FFmpeg، وهو غير متاح في الخدمة حالياً.");
+
+  const process = spawn(ffmpegPath, [
+    "-hide_banner",
+    "-loglevel",
+    "error",
+    "-i",
+    "pipe:0",
+    "-vn",
+    "-af",
+    filterExpression(data.filters),
+    "-f",
+    "s16le",
+    "-ar",
+    "48000",
+    "-ac",
+    "2",
+    "pipe:1"
+  ], { stdio: ["pipe", "pipe", "pipe"] });
+  data.filterProcess = process;
+  process.stderr.on("data", (chunk) => console.error("FFmpeg:", chunk.toString().trim()));
+  process.on("close", () => {
+    if (data.filterProcess === process) data.filterProcess = null;
+  });
+  process.on("error", (error) => console.error("FFmpeg process error:", error.message));
+  source.stream.on("error", (error) => process.stdin.destroy(error));
+  process.stdin.on("error", () => {});
+  source.stream.pipe(process.stdin);
+  return { stream: process.stdout, type: StreamType.Raw };
+}
+
+function searchRows(searchId, count) {
+  const buttons = Array.from({ length: count }, (_, index) =>
+    new ButtonBuilder()
+      .setCustomId(`musicsearch:${searchId}:${index}`)
+      .setLabel(String(index + 1))
+      .setStyle(ButtonStyle.Secondary)
+  );
+  const rows = [];
+  for (let index = 0; index < buttons.length; index += 5) {
+    rows.push(new ActionRowBuilder().addComponents(buttons.slice(index, index + 5)));
+  }
+  return rows;
+}
+
+function queueEmbed(data, page) {
+  const start = (page - 1) * 10;
+  const tracks = data.queue.slice(start, start + 10);
+  const description = tracks.length
+    ? tracks.map((track, index) => `**${start + index + 1}.** ${truncate(track.title)} • <@${track.requester}>`).join("\n")
+    : "القائمة فارغة.";
+  return new EmbedBuilder()
+    .setColor(0x7c3aed)
+    .setTitle(`📃 قائمة التشغيل • صفحة ${page}`)
+    .setDescription(`${data.current ? `🎶 الآن: **${truncate(data.current.title)}**\n\n` : ""}${description}`);
+}
+
+function queueRow(guildId, page, totalPages) {
+  return new ActionRowBuilder().addComponents(
+    new ButtonBuilder()
+      .setCustomId(`music:queueprev:${guildId}:${page}`)
+      .setEmoji("⬅️")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(page <= 1),
+    new ButtonBuilder()
+      .setCustomId(`music:queuenext:${guildId}:${page}`)
+      .setEmoji("➡️")
+      .setStyle(ButtonStyle.Secondary)
+      .setDisabled(page >= totalPages)
+  );
+}
+
 async function playNext(client, guildId) {
   const data = guildState(client, guildId);
   if (data.starting) return;
   data.starting = true;
 
   try {
-    let track = data.loop && data.current ? data.current : data.queue.shift();
-    if (!track && data.autoplay && data.current) {
-      const results = await play.search(`${data.current.title} mix`, {
+    const previous = data.current;
+    const seekSeconds = data.seekSeconds;
+    const skipped = data.skipCurrent;
+    data.seekSeconds = null;
+    data.skipCurrent = false;
+    let track = seekSeconds !== null && previous
+      ? previous
+      : (!skipped && data.loop && previous ? previous : data.queue.shift());
+    if (!track && data.autoplay && previous) {
+      const results = await play.search(`${previous.title} mix`, {
         limit: 1,
         source: { youtube: "video" }
       }).catch(() => []);
@@ -323,7 +522,7 @@ async function playNext(client, guildId) {
         track = {
           duration: results[0].durationRaw,
           provider: "YouTube autoplay",
-          requester: data.current.requester,
+          requester: previous.requester,
           thumbnail: results[0].thumbnails?.at(-1)?.url,
           title: results[0].title,
           url: results[0].url
@@ -337,14 +536,19 @@ async function playNext(client, guildId) {
       return;
     }
 
+    killFilterProcess(data);
+    const startAt = Math.max(0, Number(seekSeconds) || 0);
     const source = await play.stream(track.url, {
-      discordPlayerCompatibility: true,
-      quality: 2
+      discordPlayerCompatibility: startAt === 0,
+      quality: 2,
+      ...(startAt ? { seek: startAt } : {})
     });
     data.current = track;
-    data.resource = createAudioResource(source.stream, {
+    data.resourceStartSeconds = startAt;
+    const output = filteredStream(source, data);
+    data.resource = createAudioResource(output.stream, {
       inlineVolume: true,
-      inputType: source.type || StreamType.WebmOpus
+      inputType: output.type || StreamType.WebmOpus
     });
     data.resource.volume.setVolume(data.volume);
     data.player.play(data.resource);
@@ -355,18 +559,23 @@ async function playNext(client, guildId) {
       await data.textChannel.send("تعذر تشغيل هذا المصدر، جرّب اسمًا أو رابطًا آخر.").catch(() => {});
     }
     data.current = null;
+    data.resource = null;
+    killFilterProcess(data);
     setImmediate(() => void playNext(client, guildId));
   } finally {
     data.starting = false;
   }
 }
 
-async function connectToMemberChannel(client, message, data) {
-  const channel = message.member?.voice?.channel;
+async function connectToMemberChannel(client, context, data) {
+  const channel = context.member?.voice?.channel;
   if (!channel) throw new Error("ادخل روم صوتي أولاً.");
 
-  const me = message.guild.members.me;
+  const me = context.guild.members.me;
   const permissions = me ? channel.permissionsFor(me) : null;
+  if (permissions && !permissions.has(PermissionFlagsBits.ViewChannel)) {
+    throw new Error("ما عندي صلاحية View Channel على الروم الصوتي.");
+  }
   if (permissions && !permissions.has(PermissionFlagsBits.Connect)) {
     throw new Error("ما عندي صلاحية Connect في هذا الروم الصوتي.");
   }
@@ -374,59 +583,77 @@ async function connectToMemberChannel(client, message, data) {
     throw new Error("ما عندي صلاحية Speak في هذا الروم الصوتي.");
   }
 
+  if (data.connection?.state.status === VoiceConnectionStatus.Destroyed) data.connection = null;
   const currentChannelId = data.connection?.joinConfig?.channelId;
   if (currentChannelId && currentChannelId !== channel.id) {
     throw new Error("البوت موجود في روم صوتي آخر.");
   }
 
-  if (!data.connection || data.connection.state.status === VoiceConnectionStatus.Destroyed) {
-    data.connection = joinVoiceChannel({
-      adapterCreator: channel.guild.voiceAdapterCreator,
-      channelId: channel.id,
-      guildId: channel.guild.id,
-      group: client.user.id,
-      selfDeaf: true
-    });
-    data.connection.on("stateChange", (oldState, newState) => {
-      console.log(`[${client.user.tag}] voice ${oldState.status} -> ${newState.status}`);
-      if (newState.status === VoiceConnectionStatus.Destroyed) data.connection = null;
-    });
-    data.connection.on("error", (error) => {
-      console.error(`[${client.user.tag}] voice error:`, error.stack || error.message);
-    });
-  }
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    if (!data.connection) {
+      data.connection = joinVoiceChannel({
+        adapterCreator: channel.guild.voiceAdapterCreator,
+        channelId: channel.id,
+        guildId: channel.guild.id,
+        group: client.user.id,
+        selfDeaf: true,
+        selfMute: false
+      });
+      data.connection.on("stateChange", (oldState, newState) => {
+        console.log(`[${client.user.tag}] voice ${oldState.status} -> ${newState.status}`);
+        if (newState.status === VoiceConnectionStatus.Destroyed) data.connection = null;
+      });
+      data.connection.on("error", (error) => {
+        console.error(`[${client.user.tag}] voice error:`, error.stack || error.message);
+      });
+    }
 
-  data.connection.subscribe(data.player);
-  try {
-    await entersState(data.connection, VoiceConnectionStatus.Ready, 30_000);
-  } catch (error) {
-    const status = data.connection?.state?.status || "unknown";
-    console.error(`[${client.user.tag}] voice join failed (${status}):`, error.stack || error.message);
-    data.connection?.destroy();
-    data.connection = null;
-    throw new Error("تعذر دخول الروم خلال 30 ثانية. تأكد من Connect وSpeak للبوت ثم جرّب come مرة ثانية.");
+    data.connection.subscribe(data.player);
+    try {
+      await entersState(data.connection, VoiceConnectionStatus.Ready, 30_000);
+      return channel;
+    } catch (error) {
+      const status = data.connection?.state?.status || "unknown";
+      console.error(`[${client.user.tag}] voice join failed (${status}), attempt ${attempt + 1}:`, error.stack || error.message);
+      data.connection?.destroy();
+      data.connection = null;
+      if (attempt === 0) await new Promise((resolve) => setTimeout(resolve, 750));
+    }
   }
-  return channel;
+  throw new Error("تعذر دخول الروم خلال 30 ثانية. أعطِ البوت View Channel وConnect وSpeak ثم جرّب come مرة ثانية.");
 }
 
 function isPlaying(data) {
   return [AudioPlayerStatus.Playing, AudioPlayerStatus.Buffering, AudioPlayerStatus.Paused].includes(data.player.state.status);
 }
 
-async function enqueue(client, message, data, query) {
-  const tracks = await resolveTracks(query, message.author.id);
-  await connectToMemberChannel(client, message, data);
-  data.textChannel = message.channel;
+async function enqueueTracks(client, context, data, tracks) {
+  if (data.queue.length + tracks.length > MAX_QUEUE_SIZE) {
+    throw new Error(`الحد الأقصى للقائمة ${MAX_QUEUE_SIZE} أغنية.`);
+  }
+  await connectToMemberChannel(client, context, data);
+  data.textChannel = context.channel;
   data.queue.push(...tracks);
 
-  if (!isPlaying(data) && !data.starting) await playNext(client, message.guild.id);
+  if (!isPlaying(data) && !data.starting) await playNext(client, context.guild.id);
 
   const first = tracks[0];
   const extra = tracks.length > 1 ? `\n✅ أضيفت **${tracks.length}** أغاني للقائمة.` : "";
-  return message.reply({
+  return context.reply({
     embeds: [trackEmbed(client, data, first, "✅ تمت الإضافة")],
     content: extra || undefined
   });
+}
+
+async function enqueue(client, message, data, query) {
+  const tracks = await resolveTracks(query, message.author.id);
+  return enqueueTracks(client, {
+    authorId: message.author.id,
+    channel: message.channel,
+    guild: message.guild,
+    member: message.member,
+    reply: (payload) => message.reply(payload)
+  }, data, tracks);
 }
 
 function helpEmbed() {
@@ -437,8 +664,8 @@ function helpEmbed() {
     .addFields(
       { name: "التشغيل", value: "`play <اسم أو رابط>` أو `شغل <اسم>`\nYouTube وSoundCloud وSpotify والروابط والقوائم مدعومة." },
       { name: "التحكم", value: "`queue` القائمة • `nowplaying` الحالي • `pause` إيقاف مؤقت • `resume` متابعة\n`skip` تخطي • `stop` إيقاف • `clear` مسح الانتظار • `leave` خروج" },
-      { name: "الخيارات", value: "`loop` تكرار • `autoplay` تشغيل تلقائي • `shuffle` خلط • `volume 0-150` الصوت\n`search <اسم>` بحث • `ping` سرعة البوت • `settings` الإعدادات" },
-      { name: "اختصارات عربية", value: "`شغل` `ش` `قائمه` `الان` `تخطي` `ت` `وقف` `حذف` `خلط` `تكرار` `تلقائي` `صوت`" },
+      { name: "الخيارات", value: "`loop` تكرار • `autoplay` تشغيل تلقائي • `shuffle` خلط • `volume 0-150` الصوت\n`filters` فلاتر • `seek 1:30` تقديم • `search <اسم>` بحث\n`ping` سرعة البوت • `settings` الإعدادات" },
+      { name: "اختصارات عربية", value: "`شغل` `ش` `قائمه` `الان` `تخطي` `ت` `وقف` `حذف` `خلط` `تكرار` `تلقائي` `فلاتر` `قدم` `صوت`" },
       { name: "توجيه بوت معيّن", value: "`1play اسم الأغنية` أو منشن البوت ثم الأمر. بدون رقم يرد البوت الموجود معك فقط." }
     )
     .setFooter({ text: "Music Fleet" });
@@ -455,8 +682,20 @@ function settingsEmbed(client, data) {
       { name: "الصوت", value: `${Math.round(data.volume * 100)}`, inline: true },
       { name: "التكرار", value: data.loop ? "✅" : "☑️", inline: true },
       { name: "التشغيل التلقائي", value: data.autoplay ? "✅" : "☑️", inline: true },
+      { name: "الفلاتر", value: data.filters.size ? [...data.filters].map((filter) => FILTER_LABELS.get(filter)).join("، ") : "لا يوجد", inline: true },
       { name: "الأغاني المنتظرة", value: String(data.queue.length), inline: true }
     );
+}
+
+function parseSeekInput(value) {
+  const normalized = arabicNumber(String(value || "").trim());
+  if (!normalized || !/^\d+(?::\d{1,2}){0,2}$/.test(normalized)) return null;
+  const parts = normalized.split(":").map(Number);
+  if (parts.some((part) => !Number.isInteger(part) || part < 0)) return null;
+  if (parts.length > 1 && parts.slice(1).some((part) => part > 59)) return null;
+  if (parts.length === 1) return parts[0];
+  if (parts.length === 2) return (parts[0] * 60) + parts[1];
+  return (parts[0] * 3600) + (parts[1] * 60) + parts[2];
 }
 
 async function clearOldSlashCommands(client) {
@@ -493,7 +732,7 @@ async function handleMessage(client, message) {
     }
     if (command === "ping") return void message.reply(`🏓 ${client.ws.ping}ms`);
     if (command === "fleet") {
-      const lines = clients.map((bot, index) => `${index}. ${bot.user ? `${bot.user.tag} ✅` : "غير متصل ⏳"}`);
+      const lines = clients.map((bot, index) => `${index + 1}. ${bot.user ? `${bot.user.tag} ✅` : "غير متصل ⏳"}`);
       return void message.reply(lines.join("\n"));
     }
     if (command === "settings") return void message.reply({ embeds: [settingsEmbed(client, data)] });
@@ -504,6 +743,12 @@ async function handleMessage(client, message) {
     if (command === "leave") {
       data.queue.length = 0;
       data.current = null;
+      data.loop = false;
+      data.autoplay = false;
+      data.filters.clear();
+      data.seekSeconds = null;
+      data.skipCurrent = false;
+      killFilterProcess(data);
       data.player.stop();
       getVoiceConnection(message.guild.id, client.user.id)?.destroy();
       data.connection = null;
@@ -518,28 +763,48 @@ async function handleMessage(client, message) {
       const query = parsed.parts.join(" ");
       if (!query) return void message.reply("طريقة الاستخدام: `search <song name>`");
       const results = await play.search(query, { limit: 10, source: { youtube: "video" } });
+      if (!results.length) return void message.reply("لم أجد نتائج.");
+      const searchId = message.id;
+      const tracks = results.map((result) => ({
+        duration: result.durationRaw,
+        provider: "YouTube",
+        requester: message.author.id,
+        thumbnail: result.thumbnails?.at(-1)?.url,
+        title: result.title,
+        url: result.url
+      }));
+      pendingSearches.set(searchId, {
+        clientId: client.user.id,
+        guildId: message.guild.id,
+        requester: message.author.id,
+        tracks
+      });
+      setTimeout(() => pendingSearches.delete(searchId), 30_000).unref?.();
       const description = results.length
         ? results.map((result, index) => `**${index + 1}.** [${truncate(result.title, 80)}](${result.url}) • ${result.durationRaw || "?"}`).join("\n")
         : "لم أجد نتائج.";
-      return void message.reply({ embeds: [new EmbedBuilder().setColor(0x7c3aed).setTitle(`🔎 نتائج البحث عن ${truncate(query, 50)}`).setDescription(description)] });
+      return void message.reply({
+        components: searchRows(searchId, tracks.length),
+        embeds: [new EmbedBuilder().setColor(0x7c3aed).setTitle(`🔎 نتائج البحث عن ${truncate(query, 50)}`).setDescription(`${description}\n\nاختر رقم الأغنية من الأزرار — القائمة صالحة 30 ثانية.`)]
+      });
     }
     if (command === "queue") {
       const page = Math.max(1, Number(arabicNumber(parsed.parts[0] || "1")) || 1);
-      const start = (page - 1) * 10;
-      const tracks = data.queue.slice(start, start + 10);
-      const description = tracks.length
-        ? tracks.map((track, index) => `**${start + index + 1}.** ${truncate(track.title)} • <@${track.requester}>`).join("\n")
-        : "القائمة فارغة.";
-      const embed = new EmbedBuilder().setColor(0x7c3aed).setTitle(`📃 قائمة التشغيل • صفحة ${page}`).setDescription(
-        `${data.current ? `🎶 الآن: **${truncate(data.current.title)}**\n\n` : ""}${description}`
-      );
-      return void message.reply({ embeds: [embed] });
+      const totalPages = Math.max(1, Math.ceil(data.queue.length / 10));
+      const safePage = Math.min(page, totalPages);
+      return void message.reply({
+        components: totalPages > 1 ? [queueRow(message.guild.id, safePage, totalPages)] : [],
+        embeds: [queueEmbed(data, safePage)]
+      });
     }
     if (command === "nowplaying") {
       if (!data.current) return void message.reply("لا توجد أغنية تعمل الآن.");
       return void message.reply({ components: [controlRow(message.guild.id)], embeds: [trackEmbed(client, data, data.current, "🎶 الآن تعمل")] });
     }
     if (command === "skip") {
+      data.skipCurrent = true;
+      data.seekSeconds = null;
+      killFilterProcess(data);
       data.player.stop();
       return void message.reply("⏭️ تم التخطي.");
     }
@@ -548,6 +813,10 @@ async function handleMessage(client, message) {
       data.current = null;
       data.loop = false;
       data.autoplay = false;
+      data.filters.clear();
+      data.seekSeconds = null;
+      data.skipCurrent = false;
+      killFilterProcess(data);
       data.player.stop();
       return void message.reply("⛔ تم الإيقاف ومسح القائمة.");
     }
@@ -578,6 +847,31 @@ async function handleMessage(client, message) {
       data.autoplay = !data.autoplay;
       return void message.reply(data.autoplay ? "🔄 تم تشغيل التشغيل التلقائي." : "✅ تم إيقاف التشغيل التلقائي.");
     }
+    if (command === "filters") {
+      return void message.reply({
+        components: [filterRow(message.guild.id, [...data.filters])],
+        embeds: [filtersEmbed(data)]
+      });
+    }
+    if (command === "seek") {
+      if (!data.current) return void message.reply("لا توجد أغنية تعمل الآن.");
+      let youtubeType = null;
+      try {
+        youtubeType = play.yt_validate(data.current.url);
+      } catch (_) {
+        youtubeType = null;
+      }
+      if (youtubeType !== "video") return void message.reply("التقديم متاح حاليًا لأغاني YouTube فقط.");
+      const seconds = parseSeekInput(parsed.parts[0]);
+      if (seconds === null) return void message.reply("طريقة الاستخدام: `seek 90` أو `seek 1:30`.");
+      const duration = durationInSeconds(data.current.duration);
+      if (duration && seconds >= duration) return void message.reply(`استخدم وقتًا أقل من ${formatSeconds(duration)}.`);
+      data.seekSeconds = seconds;
+      data.skipCurrent = false;
+      killFilterProcess(data);
+      data.player.stop();
+      return void message.reply(`⏩ تم التقديم إلى ${formatSeconds(seconds)}.`);
+    }
     if (command === "volume") {
       const raw = parsed.parts[0] ? arabicNumber(parsed.parts[0]) : String(Math.round(data.volume * 100));
       const volume = Number(raw);
@@ -601,29 +895,121 @@ async function handleMessage(client, message) {
   }
 }
 
+async function memberForInteraction(interaction) {
+  if (interaction.member?.voice) return interaction.member;
+  return interaction.guild.members.fetch(interaction.user.id).catch(() => null);
+}
+
+async function requireSameVoice(interaction, data) {
+  const member = await memberForInteraction(interaction);
+  const botChannelId = data.connection?.joinConfig?.channelId;
+  if (!botChannelId || member?.voice?.channelId !== botChannelId) {
+    await interaction.reply({ content: "لازم تكون في نفس الروم الصوتي مع البوت.", ephemeral: true });
+    return null;
+  }
+  return member;
+}
+
+async function handleSearchSelection(client, interaction) {
+  const [, searchId, rawIndex] = interaction.customId.split(":");
+  const record = pendingSearches.get(searchId);
+  const index = Number(rawIndex);
+  if (!record || record.clientId !== client.user.id || !record.tracks[index]) {
+    return void interaction.reply({ content: "انتهت قائمة البحث. اكتب search مرة ثانية.", ephemeral: true });
+  }
+  if (record.guildId !== interaction.guildId) return;
+  if (record.requester !== interaction.user.id) {
+    return void interaction.reply({ content: "صاحب البحث فقط يقدر يختار أغنية.", ephemeral: true });
+  }
+
+  const member = await memberForInteraction(interaction);
+  if (!member?.voice?.channel) {
+    return void interaction.reply({ content: "ادخل روم صوتي أولاً.", ephemeral: true });
+  }
+
+  const data = guildState(client, interaction.guildId);
+  const track = record.tracks[index];
+  await interaction.deferReply({ ephemeral: true });
+  try {
+    await enqueueTracks(client, {
+      authorId: interaction.user.id,
+      channel: interaction.channel,
+      guild: interaction.guild,
+      member,
+      reply: (payload) => interaction.editReply(payload)
+    }, data, [track]);
+    pendingSearches.delete(searchId);
+    await interaction.message.edit({ components: [] }).catch(() => {});
+  } catch (error) {
+    await interaction.editReply(`❌ ${error.message || "حدث خطأ غير متوقع."}`).catch(() => {});
+  }
+}
+
 async function handleButton(client, interaction) {
+  if (!interaction.guildId) return;
+
+  if (interaction.isButton() && interaction.customId.startsWith("musicsearch:")) {
+    return handleSearchSelection(client, interaction);
+  }
+
+  if (interaction.isStringSelectMenu() && interaction.customId.startsWith("music:filters:")) {
+    const guildId = interaction.customId.split(":")[2];
+    if (guildId !== interaction.guildId) return;
+    const data = guildState(client, guildId);
+    if (data.connection && !await requireSameVoice(interaction, data)) return;
+    const values = interaction.values || [];
+    if (values.includes("clear")) data.filters.clear();
+    else {
+      data.filters.clear();
+      values.filter((value) => FILTER_LABELS.has(value)).forEach((value) => data.filters.add(value));
+    }
+    const active = [...data.filters].map((filter) => FILTER_LABELS.get(filter)).join("، ");
+    return void interaction.reply({
+      content: active ? `🎛️ الفلاتر المفعّلة: ${active}` : "✅ تم مسح كل الفلاتر.",
+      ephemeral: true
+    });
+  }
+
   if (!interaction.isButton() || !interaction.customId.startsWith("music:")) return;
-  const [, action, guildId] = interaction.customId.split(":");
+  const parts = interaction.customId.split(":");
+  const action = parts[1];
+  const guildId = parts[2];
   if (guildId !== interaction.guildId) return;
 
   const data = guildState(client, guildId);
-  const botChannelId = data.connection?.joinConfig?.channelId;
-  if (!botChannelId || interaction.member?.voice?.channelId !== botChannelId) {
-    return void interaction.reply({ content: "لازم تكون في نفس الروم الصوتي مع البوت.", ephemeral: true });
+  if (action === "queueprev" || action === "queuenext") {
+    if (!await requireSameVoice(interaction, data)) return;
+    const totalPages = Math.max(1, Math.ceil(data.queue.length / 10));
+    const oldPage = Math.max(1, Number(parts[3]) || 1);
+    const page = Math.min(totalPages, Math.max(1, oldPage + (action === "queuenext" ? 1 : -1)));
+    return void interaction.update({
+      components: totalPages > 1 ? [queueRow(guildId, page, totalPages)] : [],
+      embeds: [queueEmbed(data, page)]
+    });
   }
 
+  if (!await requireSameVoice(interaction, data)) return;
   if (action === "pause") {
     if (data.player.state.status === AudioPlayerStatus.Paused) data.player.unpause();
     else data.player.pause();
     return void interaction.reply({ content: "⏯️ تم تحديث حالة التشغيل.", ephemeral: true });
   }
   if (action === "skip") {
+    data.skipCurrent = true;
+    data.seekSeconds = null;
+    killFilterProcess(data);
     data.player.stop();
     return void interaction.reply({ content: "⏭️ تم التخطي.", ephemeral: true });
   }
   if (action === "stop") {
     data.queue.length = 0;
     data.current = null;
+    data.loop = false;
+    data.autoplay = false;
+    data.filters.clear();
+    data.seekSeconds = null;
+    data.skipCurrent = false;
+    killFilterProcess(data);
     data.player.stop();
     return void interaction.reply({ content: "⛔ تم الإيقاف.", ephemeral: true });
   }

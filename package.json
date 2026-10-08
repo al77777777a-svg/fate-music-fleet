@@ -2,14 +2,20 @@
   "name": "fate-style-music-fleet",
   "version": "1.0.0",
   "private": true,
+  "description": "Multi-bot Discord music fleet for Railway",
   "main": "src/index.js",
-  "scripts": {"start": "node src/index.js"},
-  "engines": {"node": ">=20"},
+  "scripts": {
+    "start": "node src/index.js"
+  },
+  "engines": {
+    "node": ">=20"
+  },
   "dependencies": {
     "@discordjs/voice": "^0.18.0",
     "discord.js": "^14.24.2",
     "dotenv": "^16.6.1",
     "express": "^5.1.0",
+    "ffmpeg-static": "^5.2.0",
     "play-dl": "^1.9.7"
   }
 }
