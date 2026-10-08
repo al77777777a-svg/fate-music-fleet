@@ -3,6 +3,7 @@ require("dotenv").config();
 const { spawn } = require("node:child_process");
 const express = require("express");
 const play = require("play-dl");
+const { selectRoomBot, isSameRoomChat } = require("./room-routing");
 const {
   ActionRowBuilder,
   ButtonBuilder,
@@ -139,23 +140,13 @@ function guildState(client, guildId) {
   return state.guilds.get(guildId);
 }
 
-function activeVoice(guildId, channelId = null) {
-  for (const client of clients) {
-    if (!client.user) continue;
-    const data = botStates.get(client.user.id)?.guilds.get(guildId);
-    const connection = data?.connection;
-    if (!connection || connection.state.status === VoiceConnectionStatus.Destroyed) continue;
-    if (!channelId || connection.joinConfig?.channelId === channelId) return { client, data };
-  }
-  return null;
-}
-
-function firstAvailableClient(guildId) {
-  return clients.find((client) => {
-    if (!client.user) return false;
-    const data = botStates.get(client.user.id)?.guilds.get(guildId);
-    return !data?.connection || data.connection.state.status === VoiceConnectionStatus.Destroyed;
-  });
+function botVoiceChannelId(client, guildId) {
+  const channelId = client.guilds.cache.get(guildId)?.members.me?.voice?.channelId;
+  if (channelId) return channelId;
+  const connection = botStates.get(client.user.id)?.guilds.get(guildId)?.connection;
+  return connection && connection.state.status !== VoiceConnectionStatus.Destroyed
+    ? connection.joinConfig?.channelId || null
+    : null;
 }
 
 function stripMention(client, text) {
@@ -163,7 +154,8 @@ function stripMention(client, text) {
 }
 
 function parseInput(client, message) {
-  const mentioned = message.mentions.users.has(client.user.id);
+  const targetId = message.content.trim().match(/^<@!?(\d+)>/)?.[1] || null;
+  const mentioned = targetId === client.user.id;
   const text = stripMention(client, message.content.trim());
   if (!text) return { mentioned, parts: [], targetIndex: null, text };
 
@@ -181,23 +173,24 @@ function parseInput(client, message) {
     parts,
     raw: first.toLowerCase(),
     targetIndex,
+    targetId,
     text
   };
 }
 
 function selected(client, message, parsed) {
-  if (parsed.targetIndex !== null) return parsed.targetIndex - 1 === client.botIndex;
-  if (parsed.mentioned) return true;
-
-  const memberChannelId = message.member?.voice?.channelId;
-  const active = memberChannelId ? activeVoice(message.guild.id, memberChannelId) : null;
-  if (active) return active.client.user.id === client.user.id;
-
-  // If the user is in a different room, let an unused fleet bot take that room.
-  // This keeps the “only the bot with me replies” behavior while allowing multiple rooms.
-  const available = firstAvailableClient(message.guild.id);
-  if (available) return available.user.id === client.user.id;
-  return !memberChannelId && client.botIndex === 0;
+  const bots = clients
+    .filter((bot) => bot.user && bot.guilds.cache.has(message.guild.id))
+    .map((bot) => ({ id: bot.user.id, index: bot.botIndex, channelId: botVoiceChannelId(bot, message.guild.id) }));
+  return selectRoomBot({
+    bots,
+    channelId: message.channelId,
+    memberChannelId: message.member?.voice?.channelId,
+    isVoiceChat: message.channel.isVoiceBased(),
+    command: parsed.command,
+    targetIndex: parsed.targetIndex,
+    targetId: parsed.targetId
+  }) === client.user.id;
 }
 
 function isAdministrator(message) {
@@ -598,6 +591,9 @@ async function playNext(client, guildId) {
 async function connectToMemberChannel(client, context, data) {
   const channel = context.member?.voice?.channel;
   if (!channel) throw new Error("ادخل روم صوتي أولاً.");
+  if (!context.channel?.isVoiceBased() || context.channel.id !== channel.id) {
+    throw new Error("اكتب الأمر في شات الروم الصوتي اللي أنت داخله.");
+  }
 
   const me = context.guild.members.me;
   const permissions = me ? channel.permissionsFor(me) : null;
@@ -689,13 +685,13 @@ function helpEmbed() {
   return new EmbedBuilder()
     .setColor(0x7c3aed)
     .setTitle("🎵 Music Fleet — الأوامر")
-    .setDescription("اكتب الأوامر في شات الروم الصوتي. والتشغيل المباشر مفعّل: اكتب اسم الأغنية وحده وسيبحث عنها البوت الموجود معك.")
+    .setDescription("الأوامر تعمل فقط في شات الروم الصوتي اللي أنت والبوت فيه. إذا الروم بدون بوت، اكتب join في شاته أولاً. والتشغيل المباشر مفعّل: اكتب اسم الأغنية وحده في نفس الشات.")
     .addFields(
       { name: "التشغيل", value: "`play <اسم أو رابط>` أو `شغل <اسم>`\nYouTube وSoundCloud وSpotify والروابط والقوائم مدعومة." },
       { name: "التحكم", value: "`queue` القائمة • `nowplaying` الحالي • `pause` إيقاف مؤقت • `resume` متابعة\n`skip` تخطي • `stop` إيقاف • `clear` مسح الانتظار • `leave` خروج" },
       { name: "الخيارات", value: "`loop` تكرار • `autoplay` تشغيل تلقائي • `shuffle` خلط • `volume 0-150` الصوت\n`filters` فلاتر • `seek 1:30` تقديم • `search <اسم>` بحث\n`ping` سرعة البوت • `settings` الإعدادات" },
       { name: "اختصارات عربية", value: "`شغل` `ش` `قائمه` `الان` `تخطي` `ت` `وقف` `حذف` `خلط` `تكرار` `تلقائي` `فلاتر` `قدم` `صوت`" },
-      { name: "توجيه بوت معيّن", value: "`1play اسم الأغنية` أو منشن البوت ثم الأمر. بدون رقم يرد البوت الموجود معك فقط." }
+      { name: "توجيه بوت معيّن", value: "`1play اسم الأغنية` أو منشن البوت ثم الأمر داخل شات رومه فقط. بدون رقم يرد بوت واحد من الموجودين معك. لاستدعاء بوت غير متصل، اكتب `1join` في شات رومك الصوتي." }
     )
     .setFooter({ text: "Music Fleet" });
 }
@@ -939,9 +935,14 @@ async function memberForInteraction(interaction) {
 
 async function requireSameVoice(interaction, data) {
   const member = await memberForInteraction(interaction);
-  const botChannelId = data.connection?.joinConfig?.channelId;
-  if (!botChannelId || member?.voice?.channelId !== botChannelId) {
-    await interaction.reply({ content: "لازم تكون في نفس الروم الصوتي مع البوت.", ephemeral: true });
+  const botChannelId = botVoiceChannelId(interaction.client, interaction.guildId);
+  if (!isSameRoomChat({
+    channelId: interaction.channelId,
+    memberChannelId: member?.voice?.channelId,
+    botChannelId,
+    isVoiceChat: interaction.channel?.isVoiceBased()
+  })) {
+    await interaction.reply({ content: "استخدم الأزرار في شات الروم الصوتي اللي أنت والبوت فيه.", ephemeral: true });
     return null;
   }
   return member;
@@ -959,12 +960,9 @@ async function handleSearchSelection(client, interaction) {
     return void interaction.reply({ content: "صاحب البحث فقط يقدر يختار أغنية.", ephemeral: true });
   }
 
-  const member = await memberForInteraction(interaction);
-  if (!member?.voice?.channel) {
-    return void interaction.reply({ content: "ادخل روم صوتي أولاً.", ephemeral: true });
-  }
-
   const data = guildState(client, interaction.guildId);
+  const member = await requireSameVoice(interaction, data);
+  if (!member) return;
   const track = record.tracks[index];
   await interaction.deferReply({ ephemeral: true });
   try {
@@ -993,7 +991,7 @@ async function handleButton(client, interaction) {
     const guildId = interaction.customId.split(":")[2];
     if (guildId !== interaction.guildId) return;
     const data = guildState(client, guildId);
-    if (data.connection && !await requireSameVoice(interaction, data)) return;
+    if (!await requireSameVoice(interaction, data)) return;
     const values = interaction.values || [];
     if (values.includes("clear")) data.filters.clear();
     else {
