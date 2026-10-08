@@ -600,7 +600,8 @@ async function connectToMemberChannel(client, context, data) {
         selfMute: false
       });
       data.connection.on("stateChange", (oldState, newState) => {
-        console.log(`[${client.user.tag}] voice ${oldState.status} -> ${newState.status}`);
+        const networkCode = newState.networking?.state?.code || "n/a";
+        console.log(`[${client.user.tag}] voice ${oldState.status} -> ${newState.status} (network ${networkCode})`);
         if (newState.status === VoiceConnectionStatus.Destroyed) data.connection = null;
       });
       data.connection.on("error", (error) => {
@@ -1035,7 +1036,7 @@ for (const [index, token] of tokens.entries()) {
   });
   client.botIndex = index;
   clients.push(client);
-  client.once("ready", async () => {
+  client.once("clientReady", async () => {
     console.log(`Bot ${index}/${tokens.length} online as ${client.user.tag}`);
     stateFor(client).tag = client.user.tag;
     try {
