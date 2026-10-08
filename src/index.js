@@ -4,6 +4,8 @@ const { spawn } = require("node:child_process");
 const express = require("express");
 const play = require("play-dl");
 const { selectRoomBot, isSameRoomChat } = require("./room-routing");
+const { skipTrack, skipMessage } = require("./skip-track");
+const { trackReply, volumeReply } = require("./reply-text");
 const { FILTER_LABELS, filterRow, playerComponents, playerPayload } = require("./player-ui");
 const { ensureSoundCloud, isYouTubeBlocked, searchSoundCloud, soundCloudTrack, streamTrack } = require("./music-source");
 const {
@@ -114,20 +116,22 @@ function guildState(client, guildId) {
       filters: new Set(),
       loop: false,
       player,
-      playInVoice: true,
       queue: [],
       resource: null,
       resourceStartSeconds: 0,
       seekSeconds: null,
       skipCurrent: false,
+      skipping: false,
       starting: false,
       textChannel: null,
       volume: 0.5
     };
-    player.on(AudioPlayerStatus.Idle, () => void playNext(client, guildId));
+    player.on(AudioPlayerStatus.Idle, () => {
+      if (!data.skipping) void playNext(client, guildId);
+    });
     player.on("error", (error) => {
       console.error(`[${client.user.tag}] audio error:`, error.message);
-      void playNext(client, guildId);
+      if (!data.skipping) void playNext(client, guildId);
     });
     state.guilds.set(guildId, data);
   }
@@ -352,20 +356,28 @@ function filtersEmbed(data) {
     .setFooter({ text: "اختر أكثر من فلتر من القائمة • تطبّق على الأغنية التالية" });
 }
 
-function nowPlayingPayload(client, guildId, data, track) {
+function requesterInfo(client, guildId, track) {
   const member = client.guilds.cache.get(guildId)?.members.cache.get(track.requester);
   const user = member?.user || client.users.cache.get(track.requester);
-  const requester = {
+  return {
     displayName: member?.displayName || user?.globalName || user?.username,
     avatarURL: member?.displayAvatarURL() || user?.displayAvatarURL()
   };
+}
+
+function nowPlayingPayload(client, guildId, data, track) {
+  const requester = requesterInfo(client, guildId, track);
   const permissions = data.textChannel?.permissionsFor?.(client.user);
   return playerPayload(guildId, data, track, requester, !permissions || permissions.has(PermissionFlagsBits.AttachFiles));
 }
 
 async function sendNowPlaying(client, guildId, data, track) {
   if (!data.textChannel) return;
-  const payload = nowPlayingPayload(client, guildId, data, track);
+  const requester = requesterInfo(client, guildId, track);
+  const payload = {
+    content: trackReply("Playing song", track, requester.displayName) + (track.fallbackFrom ? "\n*Source: SoundCloud*" : ""),
+    allowedMentions: { parse: [] }
+  };
   if (track.requestMessageId) payload.reply = { messageReference: track.requestMessageId, failIfNotExists: false };
   await data.textChannel.send(payload).catch((error) => console.error("Player card:", error.message));
 }
@@ -615,7 +627,7 @@ async function enqueueTracks(client, context, data, tracks) {
   for (const track of tracks) track.requestMessageId = context.messageId;
   data.queue.push(...tracks);
 
-  if (!isPlaying(data) && !data.starting) {
+  if (!isPlaying(data) && !data.starting && !data.skipping) {
     const started = await playNext(client, context.guild.id);
     if (!started) return context.acknowledge
       ? context.acknowledge(false)
@@ -642,9 +654,9 @@ function helpEmbed() {
   return new EmbedBuilder()
     .setColor(0x7c3aed)
     .setTitle("🎵 Music Fleet — الأوامر")
-    .setDescription("الأوامر تعمل فقط في شات الروم الصوتي اللي أنت والبوت فيه. إذا الروم بدون بوت، اكتب join في شاته أولاً. والتشغيل المباشر مفعّل: اكتب اسم الأغنية وحده في نفس الشات.")
+    .setDescription("الأوامر تعمل فقط في شات الروم الصوتي اللي أنت والبوت فيه. للتشغيل اكتب ش ثم اسم الأغنية أو رابطها. الكلام العادي لا يشغّل أغاني. إذا الروم بدون بوت، اكتب join في شاته أولاً.")
     .addFields(
-      { name: "التشغيل", value: "`play <اسم أو رابط>` أو `شغل <اسم>`\nYouTube وSoundCloud وSpotify والروابط والقوائم مدعومة." },
+      { name: "التشغيل", value: "`ش <اسم أو رابط>` أو `play <اسم أو رابط>` أو `شغل <اسم>`\nمثال: `ش اسم الأغنية`" },
       { name: "التحكم", value: "`queue` القائمة • `nowplaying` الحالي • `pause` إيقاف مؤقت • `resume` متابعة\n`skip` تخطي • `stop` إيقاف • `clear` مسح الانتظار • `leave` خروج" },
       { name: "الخيارات", value: "`loop` تكرار • `autoplay` تشغيل تلقائي • `shuffle` خلط • `volume 0-150` الصوت\n`filters` فلاتر • `seek 1:30` تقديم • `search <اسم>` بحث\n`ping` سرعة البوت • `settings` الإعدادات" },
       { name: "اختصارات عربية", value: "`شغل` `ش` `قائمه` `الان` `تخطي` `ت` `وقف` `حذف` `خلط` `تكرار` `تلقائي` `فلاتر` `قدم` `صوت`" },
@@ -659,7 +671,7 @@ function settingsEmbed(client, data) {
     .setColor(0x7c3aed)
     .setTitle(`⚙️ إعدادات ${client.user.username}`)
     .addFields(
-      { name: "التشغيل بالروم", value: data.playInVoice ? "✅ مفعّل" : "☑️ متوقف", inline: true },
+      { name: "طريقة التشغيل", value: "`ش اسم الأغنية` أو `play اسم الأغنية` فقط؛ الكلام العادي يُتجاهل.", inline: false },
       { name: "الروم الصوتي", value: channelId ? `<#${channelId}>` : "غير متصل", inline: true },
       { name: "الصوت", value: `${Math.round(data.volume * 100)}`, inline: true },
       { name: "التكرار", value: data.loop ? "✅" : "☑️", inline: true },
@@ -699,18 +711,13 @@ async function clearOldSlashCommands(client) {
 async function handleMessage(client, message) {
   if (message.author.bot || !message.guild) return;
   const parsed = parseInput(client, message);
-  if (!parsed.text || !selected(client, message, parsed)) return;
+  if (!parsed.text || !parsed.command || !selected(client, message, parsed)) return;
 
   const data = guildState(client, message.guild.id);
   data.textChannel = message.channel;
   const command = parsed.command;
 
   try {
-    if (!command) {
-      if (!data.playInVoice || !message.member?.voice?.channel) return;
-      return await enqueue(client, message, data, parsed.text);
-    }
-
     if (command === "help") {
       try {
         await message.author.send({ embeds: [helpEmbed()] });
@@ -746,7 +753,7 @@ async function handleMessage(client, message) {
     }
     if (command === "play") {
       const query = parsed.parts.join(" ");
-      if (!query) return void message.reply("طريقة الاستخدام: `play <song name | link>`");
+      if (!query) return void message.reply("اكتب `ش` ثم اسم الأغنية أو رابطها، مثل: `ش اسم الأغنية`.");
       return void (await enqueue(client, message, data, query));
     }
     if (command === "search") {
@@ -792,11 +799,8 @@ async function handleMessage(client, message) {
       return void message.reply(nowPlayingPayload(client, message.guild.id, data, data.current));
     }
     if (command === "skip") {
-      data.skipCurrent = true;
-      data.seekSeconds = null;
-      killFilterProcess(data);
-      data.player.stop();
-      return void message.reply("⏭️ تم التخطي.");
+      const result = await skipTrack(data, () => playNext(client, message.guild.id), () => killFilterProcess(data));
+      return void message.reply({ content: skipMessage(result, message.member?.displayName || message.author.globalName || message.author.username), allowedMentions: { parse: [] } });
     }
     if (command === "stop") {
       data.queue.length = 0;
@@ -863,21 +867,18 @@ async function handleMessage(client, message) {
       return void message.reply(`⏩ تم التقديم إلى ${formatSeconds(seconds)}.`);
     }
     if (command === "volume") {
+      const before = Math.round(data.volume * 100);
+      if (!parsed.parts[0]) return void message.reply(`*Volume:* \`${before}%\`.`);
       const raw = parsed.parts[0] ? arabicNumber(parsed.parts[0]) : String(Math.round(data.volume * 100));
       const volume = Number(raw);
       if (!Number.isFinite(volume) || volume < 0 || volume > 150) return void message.reply("استخدم رقمًا من 0 إلى 150.");
       data.volume = volume / 100;
       data.resource?.volume?.setVolume(data.volume);
-      return void message.reply(`🔊 مستوى الصوت: ${volume}`);
+      return void message.reply(volumeReply(before, volume));
     }
     if (command === "playinvcall") {
       if (!isAdministrator(message)) return void message.reply("هذا الأمر للأدمن أو المالك فقط.");
-      const value = parsed.parts[0]?.toLowerCase();
-      if (!["on", "off", "تشغيل", "ايقاف", "إيقاف"].includes(value)) {
-        return void message.reply(`التشغيل بالروم الآن: ${data.playInVoice ? "مفعّل" : "متوقف"}. استخدم \`playinvcall on\` أو \`off\`.`);
-      }
-      data.playInVoice = ["on", "تشغيل"].includes(value);
-      return void message.reply(data.playInVoice ? "✅ صار يشتغل بمجرد كتابة اسم الأغنية في شات الروم." : "☑️ تم إيقاف التشغيل بالاسم المباشر.");
+      return void message.reply("التشغيل بالرسائل العادية مُلغى. استخدم `ش اسم الأغنية` أو `play اسم الأغنية` داخل شات الروم الصوتي.");
     }
   } catch (error) {
     console.error(`[${client.user.tag}] command error:`, error.message);
@@ -987,11 +988,9 @@ async function handleButton(client, interaction) {
     return void interaction.update({ components: playerComponents(guildId, data) });
   }
   if (action === "skip") {
-    data.skipCurrent = true;
-    data.seekSeconds = null;
-    killFilterProcess(data);
-    data.player.stop();
-    return void interaction.reply({ content: "⏭️ تم التخطي.", ephemeral: true });
+    await interaction.deferReply({ ephemeral: true });
+    const result = await skipTrack(data, () => playNext(client, guildId), () => killFilterProcess(data));
+    return void interaction.editReply({ content: skipMessage(result, interaction.member?.displayName || interaction.user.globalName || interaction.user.username), allowedMentions: { parse: [] } });
   }
   if (action === "stop") {
     data.queue.length = 0;
@@ -1010,10 +1009,11 @@ async function handleButton(client, interaction) {
     return void interaction.reply({ content: data.loop ? "🔁 التكرار مفعّل." : "✅ التكرار متوقف.", ephemeral: true });
   }
   if (["volume", "volup", "voldown"].includes(action)) {
+    const before = Math.round(data.volume * 100);
     const delta = action === "voldown" ? -0.1 : 0.1;
     data.volume = Math.max(0, Math.min(1.5, Math.round((data.volume + delta) * 100) / 100));
     data.resource?.volume?.setVolume(data.volume);
-    return void interaction.reply({ content: `🔊 مستوى الصوت: ${Math.round(data.volume * 100)}`, ephemeral: true });
+    return void interaction.reply({ content: volumeReply(before, data.volume * 100), ephemeral: true });
   }
 }
 
