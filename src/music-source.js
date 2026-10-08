@@ -1,4 +1,5 @@
 const play = require("play-dl");
+const { streamYouTube } = require("./youtube-source");
 
 let soundCloudReady;
 let youtubeBlockedUntil = 0;
@@ -64,8 +65,24 @@ function soundCloudTrack(track, requester) {
 
 async function searchSoundCloud(query, requester, limit = 5) {
   await ensureSoundCloud();
-  const tracks = await play.search(query, { limit, source: { soundcloud: "tracks" } });
-  return tracks.map((track) => soundCloudTrack(track, requester));
+  const tracks = await play.search(query, { limit: Math.max(limit, 5), source: { soundcloud: "tracks" } });
+  return rankSoundCloud(query, tracks).slice(0, limit).map((track) => soundCloudTrack(track, requester));
+}
+
+function rankSoundCloud(query, tracks) {
+  const expected = normalize(query);
+  const words = expected.split(" ").filter(Boolean);
+  const score = (track) => {
+    const actual = normalize(track.name);
+    const actualWords = new Set(actual.split(" "));
+    let value = words.filter((word) => actualWords.has(word)).length * 10;
+    if (actual === expected) value += 30;
+    for (const modifier of ["remix", "cover", "nightcore", "slowed", "sped", "karaoke", "ريمكس", "بطيء", "مسرع"]) {
+      if (actual.includes(modifier) && !expected.includes(modifier)) value -= 25;
+    }
+    return value;
+  };
+  return [...tracks].sort((a, b) => score(b) - score(a));
 }
 
 async function streamTrack(track, startAt = 0) {
@@ -73,6 +90,7 @@ async function streamTrack(track, startAt = 0) {
   if (isSoundCloud) await ensureSoundCloud();
   try {
     if (!isSoundCloud && youtubeBlockedUntil > Date.now()) throw new Error("Sign in to confirm you’re not a bot");
+    if (!isSoundCloud) return await streamYouTube(track, startAt);
     return await play.stream(track.url, { quality: 2, discordPlayerCompatibility: startAt === 0, ...(startAt ? { seek: startAt } : {}) });
   } catch (error) {
     if (isSoundCloud || !isYouTubeBlocked(error) || startAt) throw error;
@@ -91,4 +109,4 @@ async function streamTrack(track, startAt = 0) {
   }
 }
 
-module.exports = { ensureSoundCloud, isYouTubeBlocked, matchingTrack, queryVariants, searchSoundCloud, soundCloudTrack, streamTrack };
+module.exports = { ensureSoundCloud, isYouTubeBlocked, matchingTrack, queryVariants, rankSoundCloud, searchSoundCloud, soundCloudTrack, streamTrack };

@@ -296,7 +296,7 @@ async function spotifyTracks(url, requester) {
 }
 
 async function resolveTracks(query, requester) {
-  const value = query.trim();
+  const value = query.trim().replace(/^(?:yt|youtube|يوتيوب)\s+/i, "");
   if (!value) throw new Error("اكتب اسم الأغنية أو الرابط.");
   const soundCloudQuery = value.match(/^(?:sc|soundcloud|ساوندكلاود)\s+(.+)$/i)?.[1];
   if (soundCloudQuery) {
@@ -420,6 +420,7 @@ function filteredStream(source, data) {
     "-hide_banner",
     "-loglevel",
     "error",
+    ...(source.type === StreamType.Raw ? ["-f", "s16le", "-ar", "48000", "-ac", "2"] : []),
     "-i",
     "pipe:0",
     "-vn",
@@ -436,6 +437,7 @@ function filteredStream(source, data) {
   data.filterProcess = process;
   process.stderr.on("data", (chunk) => console.error("FFmpeg:", chunk.toString().trim()));
   process.on("close", () => {
+    source.stream.destroy();
     if (data.filterProcess === process) data.filterProcess = null;
   });
   process.on("error", (error) => console.error("FFmpeg process error:", error.message));
