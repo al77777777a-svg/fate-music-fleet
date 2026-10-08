@@ -216,6 +216,34 @@ function truncate(value, max = 90) {
   return text.length > max ? `${text.slice(0, max - 1)}…` : text;
 }
 
+function sleep(milliseconds) {
+  return new Promise((resolve) => setTimeout(resolve, milliseconds));
+}
+
+function isRateLimited(error) {
+  return Boolean(error?.status === 429 || error?.code === 429 || /\b429\b/.test(String(error?.message || "")));
+}
+
+function publicError(error) {
+  if (isRateLimited(error)) return "المصدر رفض طلب البحث مؤقتًا. انتظر 10 ثواني ثم جرّب مرة ثانية.";
+  if (error?.name === "AbortError") return "انتهت مهلة الاتصال. تأكد من صلاحيات البوت ثم جرّب مرة ثانية.";
+  return error?.message || "حدث خطأ غير متوقع.";
+}
+
+async function youtubeSearch(query, options) {
+  let lastError;
+  for (let attempt = 0; attempt < 2; attempt += 1) {
+    try {
+      return await play.search(query, options);
+    } catch (error) {
+      lastError = error;
+      if (!isRateLimited(error) || attempt === 1) throw error;
+      await sleep(1200);
+    }
+  }
+  throw lastError;
+}
+
 function providerFor(url) {
   if (/spotify\.com/i.test(url)) return "Spotify → YouTube";
   if (/soundcloud\.com/i.test(url)) return "SoundCloud";
@@ -255,7 +283,7 @@ async function spotifyTracks(url, requester) {
 
   for (const track of tracks.slice(0, 25)) {
     const artists = (track.artists || []).map((artist) => artist.name).join(" ");
-    const search = await play.search(`${track.name} ${artists}`, {
+    const search = await youtubeSearch(`${track.name} ${artists}`, {
       limit: 1,
       source: { youtube: "video" }
     });
@@ -308,7 +336,7 @@ async function resolveTracks(query, requester) {
     return [{ ...metadata, provider: providerFor(value), requester, url: value }];
   }
 
-  const results = await play.search(value, { limit: 1, source: { youtube: "video" } });
+  const results = await youtubeSearch(value, { limit: 1, source: { youtube: "video" } });
   if (!results.length) throw new Error("لم أجد الأغنية. جرّب كلمات أوضح.");
   return [{
     duration: results[0].durationRaw,
@@ -514,7 +542,7 @@ async function playNext(client, guildId) {
       ? previous
       : (!skipped && data.loop && previous ? previous : data.queue.shift());
     if (!track && data.autoplay && previous) {
-      const results = await play.search(`${previous.title} mix`, {
+      const results = await youtubeSearch(`${previous.title} mix`, {
         limit: 1,
         source: { youtube: "video" }
       }).catch(() => []);
@@ -704,7 +732,15 @@ async function clearOldSlashCommands(client) {
   const route = process.env.TEST_GUILD_ID
     ? Routes.applicationGuildCommands(client.user.id, process.env.TEST_GUILD_ID)
     : Routes.applicationCommands(client.user.id);
-  await rest.put(route, { body: [] });
+  for (let attempt = 0; attempt < 3; attempt += 1) {
+    try {
+      await rest.put(route, { body: [] });
+      return;
+    } catch (error) {
+      if (!isRateLimited(error) || attempt === 2) throw error;
+      await sleep(1500 * (attempt + 1));
+    }
+  }
 }
 
 async function handleMessage(client, message) {
@@ -763,7 +799,7 @@ async function handleMessage(client, message) {
     if (command === "search") {
       const query = parsed.parts.join(" ");
       if (!query) return void message.reply("طريقة الاستخدام: `search <song name>`");
-      const results = await play.search(query, { limit: 10, source: { youtube: "video" } });
+      const results = await youtubeSearch(query, { limit: 10, source: { youtube: "video" } });
       if (!results.length) return void message.reply("لم أجد نتائج.");
       const searchId = message.id;
       const tracks = results.map((result) => ({
@@ -892,7 +928,7 @@ async function handleMessage(client, message) {
     }
   } catch (error) {
     console.error(`[${client.user.tag}] command error:`, error.message);
-    await message.reply(`❌ ${error.message || "حدث خطأ غير متوقع."}`).catch(() => {});
+    await message.reply(`❌ ${publicError(error)}`).catch(() => {});
   }
 }
 
@@ -942,7 +978,7 @@ async function handleSearchSelection(client, interaction) {
     pendingSearches.delete(searchId);
     await interaction.message.edit({ components: [] }).catch(() => {});
   } catch (error) {
-    await interaction.editReply(`❌ ${error.message || "حدث خطأ غير متوقع."}`).catch(() => {});
+    await interaction.editReply(`❌ ${publicError(error)}`).catch(() => {});
   }
 }
 
@@ -1040,6 +1076,7 @@ for (const [index, token] of tokens.entries()) {
     console.log(`Bot ${index}/${tokens.length} online as ${client.user.tag}`);
     stateFor(client).tag = client.user.tag;
     try {
+      await sleep(index * 1200);
       await clearOldSlashCommands(client);
       console.log(`Old slash commands cleared for ${client.user.tag}`);
     } catch (error) {
@@ -1056,4 +1093,10 @@ for (const [index, token] of tokens.entries()) {
   client.login(token).catch((error) => console.error(`Bot ${index} login failed:`, error.message));
 }
 
-process.on("unhandledRejection", (error) => console.error("Unhandled rejection:", error));
+process.on("unhandledRejection", (error) => {
+  if (isRateLimited(error)) {
+    console.warn("An upstream request was rate-limited; the bot remains online.");
+    return;
+  }
+  console.error("Unhandled rejection:", error);
+});
