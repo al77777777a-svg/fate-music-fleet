@@ -152,7 +152,7 @@ function parseInput(client, message) {
 }
 
 function selected(client, message, parsed) {
-  if (parsed.targetIndex !== null) return parsed.targetIndex === client.botIndex;
+  if (parsed.targetIndex !== null) return parsed.targetIndex - 1 === client.botIndex;
   if (parsed.mentioned) return true;
 
   const active = activeVoice(message.guild.id);
