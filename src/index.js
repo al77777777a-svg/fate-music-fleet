@@ -365,6 +365,15 @@ async function connectToMemberChannel(client, message, data) {
   const channel = message.member?.voice?.channel;
   if (!channel) throw new Error("ادخل روم صوتي أولاً.");
 
+  const me = message.guild.members.me;
+  const permissions = me ? channel.permissionsFor(me) : null;
+  if (permissions && !permissions.has(PermissionFlagsBits.Connect)) {
+    throw new Error("ما عندي صلاحية Connect في هذا الروم الصوتي.");
+  }
+  if (permissions && !permissions.has(PermissionFlagsBits.Speak)) {
+    throw new Error("ما عندي صلاحية Speak في هذا الروم الصوتي.");
+  }
+
   const currentChannelId = data.connection?.joinConfig?.channelId;
   if (currentChannelId && currentChannelId !== channel.id) {
     throw new Error("البوت موجود في روم صوتي آخر.");
@@ -378,13 +387,25 @@ async function connectToMemberChannel(client, message, data) {
       group: client.user.id,
       selfDeaf: true
     });
-    data.connection.on("stateChange", (_oldState, newState) => {
+    data.connection.on("stateChange", (oldState, newState) => {
+      console.log(`[${client.user.tag}] voice ${oldState.status} -> ${newState.status}`);
       if (newState.status === VoiceConnectionStatus.Destroyed) data.connection = null;
+    });
+    data.connection.on("error", (error) => {
+      console.error(`[${client.user.tag}] voice error:`, error.stack || error.message);
     });
   }
 
   data.connection.subscribe(data.player);
-  await entersState(data.connection, VoiceConnectionStatus.Ready, 15_000);
+  try {
+    await entersState(data.connection, VoiceConnectionStatus.Ready, 30_000);
+  } catch (error) {
+    const status = data.connection?.state?.status || "unknown";
+    console.error(`[${client.user.tag}] voice join failed (${status}):`, error.stack || error.message);
+    data.connection?.destroy();
+    data.connection = null;
+    throw new Error("تعذر دخول الروم خلال 30 ثانية. تأكد من Connect وSpeak للبوت ثم جرّب come مرة ثانية.");
+  }
   return channel;
 }
 
