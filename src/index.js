@@ -4,6 +4,8 @@ const { spawn } = require("node:child_process");
 const express = require("express");
 const play = require("play-dl");
 const { selectRoomBot, isSameRoomChat } = require("./room-routing");
+const { FILTER_LABELS, filterRow, playerComponents, playerPayload } = require("./player-ui");
+const { ensureSoundCloud, isYouTubeBlocked, searchSoundCloud, soundCloudTrack, streamTrack } = require("./music-source");
 const {
   ActionRowBuilder,
   ButtonBuilder,
@@ -13,8 +15,7 @@ const {
   GatewayIntentBits,
   PermissionFlagsBits,
   REST,
-  Routes,
-  StringSelectMenuBuilder
+  Routes
 } = require("discord.js");
 const {
   AudioPlayerStatus,
@@ -44,13 +45,6 @@ const botStates = new Map();
 const pendingSearches = new Map();
 const ARABIC_DIGITS = "٠١٢٣٤٥٦٧٨٩";
 const MAX_QUEUE_SIZE = 100;
-const FILTER_LABELS = new Map([
-  ["8d", "8D"],
-  ["nightcore", "Nightcore"],
-  ["bassboost", "BassBoost"],
-  ["vaporwave", "Vaporwave"],
-  ["slowmode", "Slowmode"]
-]);
 let ffmpegPath = null;
 try {
   ffmpegPath = require("ffmpeg-static");
@@ -218,6 +212,7 @@ function isRateLimited(error) {
 }
 
 function publicError(error) {
+  if (isYouTubeBlocked(error)) return "YouTube يرفض التشغيل من خادم Railway حاليًا. جرّب رابط SoundCloud أو play sc اسم الأغنية.";
   if (isRateLimited(error)) return "المصدر رفض طلب البحث مؤقتًا. انتظر 10 ثواني ثم جرّب مرة ثانية.";
   if (error?.name === "AbortError") return "انتهت مهلة الاتصال. تأكد من صلاحيات البوت ثم جرّب مرة ثانية.";
   return error?.message || "حدث خطأ غير متوقع.";
@@ -260,8 +255,9 @@ async function titleForUrl(url) {
 
   try {
     if (/soundcloud\.com/i.test(url)) {
+      await ensureSoundCloud();
       const sound = await play.soundcloud(url);
-      return { title: sound.name || sound.title || "SoundCloud track" };
+      return soundCloudTrack(sound);
     }
   } catch (_) {
     // Keep a useful fallback title.
@@ -298,6 +294,12 @@ async function spotifyTracks(url, requester) {
 async function resolveTracks(query, requester) {
   const value = query.trim();
   if (!value) throw new Error("اكتب اسم الأغنية أو الرابط.");
+  const soundCloudQuery = value.match(/^(?:sc|soundcloud|ساوندكلاود)\s+(.+)$/i)?.[1];
+  if (soundCloudQuery) {
+    const tracks = await searchSoundCloud(soundCloudQuery, requester, 1);
+    if (!tracks.length) throw new Error("لم أجد الأغنية على SoundCloud.");
+    return tracks;
+  }
 
   if (/^https?:\/\//i.test(value)) {
     if (/spotify\.com/i.test(value)) return spotifyTracks(value, requester);
@@ -341,33 +343,6 @@ async function resolveTracks(query, requester) {
   }];
 }
 
-function controlRow(guildId) {
-  return new ActionRowBuilder().addComponents(
-    new ButtonBuilder().setCustomId(`music:pause:${guildId}`).setEmoji("⏯️").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`music:skip:${guildId}`).setEmoji("⏭️").setStyle(ButtonStyle.Primary),
-    new ButtonBuilder().setCustomId(`music:stop:${guildId}`).setEmoji("⛔").setStyle(ButtonStyle.Danger),
-    new ButtonBuilder().setCustomId(`music:loop:${guildId}`).setEmoji("🔁").setStyle(ButtonStyle.Secondary),
-    new ButtonBuilder().setCustomId(`music:volume:${guildId}`).setEmoji("🔊").setStyle(ButtonStyle.Secondary)
-  );
-}
-
-function filterRow(guildId, selected = []) {
-  const options = [...FILTER_LABELS.entries()].map(([value, label]) => ({
-    label,
-    value,
-    default: selected.includes(value)
-  }));
-  options.push({ label: "مسح كل الفلاتر", value: "clear", description: "إيقاف المؤثرات الصوتية" });
-  return new ActionRowBuilder().addComponents(
-    new StringSelectMenuBuilder()
-      .setCustomId(`music:filters:${guildId}`)
-      .setPlaceholder("اختر فلاتر الصوت")
-      .setMinValues(1)
-      .setMaxValues(FILTER_LABELS.size)
-      .addOptions(options)
-  );
-}
-
 function filtersEmbed(data) {
   const active = [...data.filters].map((filter) => FILTER_LABELS.get(filter)).filter(Boolean);
   return new EmbedBuilder()
@@ -377,33 +352,22 @@ function filtersEmbed(data) {
     .setFooter({ text: "اختر أكثر من فلتر من القائمة • تطبّق على الأغنية التالية" });
 }
 
-function trackEmbed(client, data, track, title) {
-  const embed = new EmbedBuilder()
-    .setColor(0x7c3aed)
-    .setTitle(title)
-    .setDescription(`[${truncate(track.title)}](${track.url})`)
-    .addFields(
-      { name: "طلبها", value: `<@${track.requester}>`, inline: true },
-      { name: "المصدر", value: track.provider || "Music Fleet", inline: true },
-      { name: "المدة", value: track.duration || "غير معروفة", inline: true }
-    )
-    .setFooter({ text: `${client.user.username} • Music Fleet` });
-  const duration = durationInSeconds(track.duration);
-  const position = data?.current === track ? currentPosition(data) : 0;
-  if (duration && Number.isFinite(position)) {
-    embed.addFields({ name: "التقدّم", value: `${progressBar(position, duration)}\n${formatSeconds(position)} / ${formatSeconds(duration)}` });
-  }
-  if (track.thumbnail) embed.setThumbnail(track.thumbnail);
-  return embed;
+function nowPlayingPayload(client, guildId, data, track) {
+  const member = client.guilds.cache.get(guildId)?.members.cache.get(track.requester);
+  const user = member?.user || client.users.cache.get(track.requester);
+  const requester = {
+    displayName: member?.displayName || user?.globalName || user?.username,
+    avatarURL: member?.displayAvatarURL() || user?.displayAvatarURL()
+  };
+  const permissions = data.textChannel?.permissionsFor?.(client.user);
+  return playerPayload(guildId, data, track, requester, !permissions || permissions.has(PermissionFlagsBits.AttachFiles));
 }
 
 async function sendNowPlaying(client, guildId, data, track) {
   if (!data.textChannel) return;
-  await data.textChannel.send({
-    allowedMentions: { users: [track.requester] },
-    components: [controlRow(guildId)],
-    embeds: [trackEmbed(client, data, track, "🎶 Playing Song")]
-  }).catch(() => {});
+  const payload = nowPlayingPayload(client, guildId, data, track);
+  if (track.requestMessageId) payload.reply = { messageReference: track.requestMessageId, failIfNotExists: false };
+  await data.textChannel.send(payload).catch((error) => console.error("Player card:", error.message));
 }
 
 function durationInSeconds(value) {
@@ -419,16 +383,6 @@ function formatSeconds(value) {
   const minutes = Math.floor((seconds % 3600) / 60);
   const rest = String(seconds % 60).padStart(2, "0");
   return hours ? `${hours}:${String(minutes).padStart(2, "0")}:${rest}` : `${minutes}:${rest}`;
-}
-
-function progressBar(position, duration) {
-  const size = 12;
-  const filled = Math.min(size, Math.max(0, Math.round((position / duration) * size)));
-  return `${"█".repeat(filled)}${"—".repeat(size - filled)}`;
-}
-
-function currentPosition(data) {
-  return (data.resourceStartSeconds || 0) + ((data.resource?.playbackDuration || 0) / 1000);
 }
 
 function killFilterProcess(data) {
@@ -559,11 +513,7 @@ async function playNext(client, guildId) {
 
     killFilterProcess(data);
     const startAt = Math.max(0, Number(seekSeconds) || 0);
-    const source = await play.stream(track.url, {
-      discordPlayerCompatibility: startAt === 0,
-      quality: 2,
-      ...(startAt ? { seek: startAt } : {})
-    });
+    const source = await streamTrack(track, startAt);
     data.current = track;
     data.resourceStartSeconds = startAt;
     const output = filteredStream(source, data);
@@ -573,16 +523,20 @@ async function playNext(client, guildId) {
     });
     data.resource.volume.setVolume(data.volume);
     data.player.play(data.resource);
+    await entersState(data.player, AudioPlayerStatus.Playing, 15_000);
     await sendNowPlaying(client, guildId, data, track);
+    return true;
   } catch (error) {
     console.error(`[${client.user.tag}] stream error:`, error.message);
     if (data.textChannel) {
-      await data.textChannel.send("تعذر تشغيل هذا المصدر، جرّب اسمًا أو رابطًا آخر.").catch(() => {});
+      await data.textChannel.send(`❌ ${publicError(error)}`).catch(() => {});
     }
     data.current = null;
     data.resource = null;
     killFilterProcess(data);
-    setImmediate(() => void playNext(client, guildId));
+    data.player.stop();
+    if (data.queue.length) setImmediate(() => void playNext(client, guildId));
+    return false;
   } finally {
     data.starting = false;
   }
@@ -658,16 +612,17 @@ async function enqueueTracks(client, context, data, tracks) {
   }
   await connectToMemberChannel(client, context, data);
   data.textChannel = context.channel;
+  for (const track of tracks) track.requestMessageId = context.messageId;
   data.queue.push(...tracks);
 
-  if (!isPlaying(data) && !data.starting) await playNext(client, context.guild.id);
-
-  const first = tracks[0];
-  const extra = tracks.length > 1 ? `\n✅ أضيفت **${tracks.length}** أغاني للقائمة.` : "";
-  return context.reply({
-    embeds: [trackEmbed(client, data, first, "✅ تمت الإضافة")],
-    content: extra || undefined
-  });
+  if (!isPlaying(data) && !data.starting) {
+    const started = await playNext(client, context.guild.id);
+    if (!started) return context.acknowledge
+      ? context.acknowledge(false)
+      : context.reply({ content: "❌ لم يبدأ التشغيل. سبب الخطأ موجود في شات الروم." });
+    return context.acknowledge ? context.acknowledge(true) : context.reply({ content: "✅ بدأ التشغيل." });
+  }
+  return context.acknowledge ? context.acknowledge(true) : context.reply({ content: "✅ تمت الإضافة إلى الانتظار." });
 }
 
 async function enqueue(client, message, data, query) {
@@ -677,6 +632,8 @@ async function enqueue(client, message, data, query) {
     channel: message.channel,
     guild: message.guild,
     member: message.member,
+    messageId: message.id,
+    acknowledge: (success) => message.react(success ? "✅" : "❌").catch(() => {}),
     reply: (payload) => message.reply(payload)
   }, data, tracks);
 }
@@ -832,7 +789,7 @@ async function handleMessage(client, message) {
     }
     if (command === "nowplaying") {
       if (!data.current) return void message.reply("لا توجد أغنية تعمل الآن.");
-      return void message.reply({ components: [controlRow(message.guild.id)], embeds: [trackEmbed(client, data, data.current, "🎶 الآن تعمل")] });
+      return void message.reply(nowPlayingPayload(client, message.guild.id, data, data.current));
     }
     if (command === "skip") {
       data.skipCurrent = true;
@@ -1027,7 +984,7 @@ async function handleButton(client, interaction) {
   if (action === "pause") {
     if (data.player.state.status === AudioPlayerStatus.Paused) data.player.unpause();
     else data.player.pause();
-    return void interaction.reply({ content: "⏯️ تم تحديث حالة التشغيل.", ephemeral: true });
+    return void interaction.update({ components: playerComponents(guildId, data) });
   }
   if (action === "skip") {
     data.skipCurrent = true;
@@ -1052,8 +1009,9 @@ async function handleButton(client, interaction) {
     data.loop = !data.loop;
     return void interaction.reply({ content: data.loop ? "🔁 التكرار مفعّل." : "✅ التكرار متوقف.", ephemeral: true });
   }
-  if (action === "volume") {
-    data.volume = Math.min(1.5, data.volume + 0.1);
+  if (["volume", "volup", "voldown"].includes(action)) {
+    const delta = action === "voldown" ? -0.1 : 0.1;
+    data.volume = Math.max(0, Math.min(1.5, Math.round((data.volume + delta) * 100) / 100));
     data.resource?.volume?.setVolume(data.volume);
     return void interaction.reply({ content: `🔊 مستوى الصوت: ${Math.round(data.volume * 100)}`, ephemeral: true });
   }
