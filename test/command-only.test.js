@@ -11,9 +11,13 @@ const aliases = source.slice(source.indexOf("const aliasGroups ="), source.index
 const parser = source.slice(source.indexOf("function stripMention("), source.indexOf("function selected("));
 const handler = source.slice(source.indexOf("async function handleMessage("), source.indexOf("async function memberForInteraction("));
 
-function harness({ match = true } = {}) {
+function harness({ match = true, prefixes = {} } = {}) {
   const effects = [];
   const data = { playInVoice: true, nameSearchBusy: false, lastNameSearchAt: 0 };
+  const settings = { playinvc: true, platform: "youtube" };
+  const bot = { user: { id: "123" }, botIndex: 0, guilds: { cache: new Map([["guild", {}]]) } };
+  const adminCalls = [];
+  const record = (name, ctx) => adminCalls.push(`${name}:${ctx.command}:${ctx.args.join(" ")}`);
   const handleMessage = vm.runInNewContext(`${aliases}\n${parser}\n${handler}\nhandleMessage`, {
     selected: () => true,
     directSongQuery,
@@ -22,7 +26,20 @@ function harness({ match = true } = {}) {
     resolveTracks: async (query) => { effects.push(`search:${query}`); return match ? [{ title: query }] : []; },
     enqueueTracks: async (_client, _context, _data, tracks) => effects.push(`matched:${tracks[0].title}`),
     messageContext: () => ({}),
-    isAdministrator: () => true,
+    clients: [bot],
+    store: {},
+    prefixOf: (_store, _guild, id, index) => prefixes[id] ?? String(index),
+    settingsOf: () => settings,
+    isFleetLeader: () => true,
+    tierFor: () => 3,
+    Tier: { EVERYONE: 0, ADMIN: 1, OWNER: 2, ALL_OWNER: 3 },
+    stay: { handle: async (ctx) => { record("stay", ctx); return false; } },
+    ownerCommands: async (ctx) => { record("owner", ctx); return false; },
+    settingsCommands: async (ctx) => {
+      record("settings", ctx);
+      if (ctx.command === "playinvcall") settings.playinvc = ctx.args[0] === "on";
+      return true;
+    },
     arabicNumber: (text) => text.replace(/[٠-٩]/g, (digit) => "٠١٢٣٤٥٦٧٨٩".indexOf(digit)),
     console,
     publicError: (error) => error.message
@@ -30,8 +47,10 @@ function harness({ match = true } = {}) {
   return {
     effects,
     data,
-    send: (content) => handleMessage({ user: { id: "123" }, ws: { ping: 25 } }, {
-      content, author: { bot: false }, guild: { id: "guild" }, channel: {},
+    settings,
+    adminCalls,
+    send: (content) => handleMessage({ user: { id: "123" }, botIndex: 0, ws: { ping: 25 } }, {
+      content, author: { bot: false }, guild: { id: "guild" }, channel: { isVoiceBased: () => true },
       member: { voice: { channel: {}, channelId: "voice" } },
       reply: async (text) => effects.push(`reply:${text}`)
     })
@@ -70,7 +89,7 @@ test("other recognized commands still work", async () => {
 test("administrators can switch direct title matching off while keeping commands", async () => {
   const h = harness();
   await h.send("playinvcall off");
-  assert.equal(h.data.playInVoice, false);
+  assert.equal(h.settings.playinvc, false);
   h.effects.length = 0;
   await h.send("اي شي");
   assert.deepEqual(h.effects, ["state"]);
@@ -95,4 +114,33 @@ test("unmatched names stay silent and rapid direct searches are limited", async 
   h.effects.length = 0;
   await h.send("another title");
   assert.deepEqual(h.effects, ["state"]);
+});
+
+test("admin words go to the 24/7, owner and settings modules, not to playback", async () => {
+  const cases = [
+    ["come", "stay:come:"], ["afk", "stay:afk:"], ["le", "stay:le:"], ["اطلع", "stay:leave:"], ["setup", "stay:setup:"],
+    ["setupall", "stay:setupall:"], ["checkchannelall", "stay:checkchannelall:"],
+    ["ao <@555>", "owner:ao:<@555>"], ["addownerall <@555>", "owner:addownerall:<@555>"],
+    ["prefix 1", "settings:prefix:1"], ["langall ar", "settings:langall:ar"], ["callplay off", "settings:playinvcall:off"]
+  ];
+  for (const [text, expected] of cases) {
+    const h = harness();
+    await h.send(text);
+    assert.deepEqual(h.effects, [], text);                    // ما بدأ تشغيل ولا بحث
+    assert.ok(h.adminCalls.includes(expected), `${text} → ${h.adminCalls.join(' | ')}`);
+  }
+});
+
+test("custom prefixes target the bot, and none turns the number prefix off", async () => {
+  const custom = harness({ prefixes: { 123: "!" } });
+  await custom.send("!play اي شي");
+  assert.deepEqual(custom.effects, ["state", "play:اي شي"]);
+
+  const off = harness({ prefixes: { 123: "" } });
+  await off.send("1play اي شي");                              // الرقم ما عاد أمر: يعامل كعنوان عادي
+  assert.ok(!off.effects.includes("play:اي شي"));
+  assert.ok(off.effects.includes("search:1play اي شي"));
+  off.effects.length = 0;
+  await off.send("play اي شي");                               // بدون بادئة يشتغل
+  assert.deepEqual(off.effects, ["state", "play:اي شي"]);
 });

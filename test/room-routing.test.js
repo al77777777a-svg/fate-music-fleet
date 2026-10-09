@@ -83,3 +83,17 @@ test("buttons and search selections require both member and chat in the bot room
     { botChannelId: "voice-b" }
   ]) assert.equal(isSameRoomChat({ ...context, ...change }), false);
 });
+
+test("a configured commands chat works for members in a bot room, but only there", () => {
+  const chat = { ...base, channelId: "commands", isVoiceChat: false, isCommandsChat: true };
+  for (const command of commands) assert.equal(selectRoomBot({ ...chat, command }), "one");
+  assert.equal(selectRoomBot({ ...chat, memberChannelId: null }), null);                  // لازم يكون في روم
+  assert.equal(selectRoomBot({ ...chat, memberChannelId: "voice-b" }), "two");           // البوت اللي في رومه
+  assert.equal(selectRoomBot({ ...chat, command: "play", targetIndex: 2 }), null);       // ما يوصل لبوت في روم ثاني
+});
+
+test("setup, like join, can bring an idle bot into an empty room", () => {
+  const emptyRoom = { ...base, channelId: "voice-c", memberChannelId: "voice-c" };
+  assert.equal(selectRoomBot({ ...emptyRoom, command: "setup" }), "three");
+  assert.equal(selectRoomBot({ ...emptyRoom, command: "play" }), null);
+});
