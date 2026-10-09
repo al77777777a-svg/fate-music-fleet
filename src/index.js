@@ -1,4 +1,4 @@
-require("dotenv").config();
+require("dotenv").config({ quiet: true });
 
 const { spawn } = require("node:child_process");
 const express = require("express");
@@ -6,6 +6,7 @@ const play = require("play-dl");
 const { selectRoomBot, isSameRoomChat } = require("./room-routing");
 const { skipTrack, skipMessage } = require("./skip-track");
 const { trackReply, volumeReply } = require("./reply-text");
+const { directSongQuery, matchingSong } = require("./song-matching");
 const { FILTER_LABELS, filterRow, playerComponents, playerPayload } = require("./player-ui");
 const { ensureSoundCloud, isYouTubeBlocked, searchSoundCloud, soundCloudTrack, streamTrack } = require("./music-source");
 const {
@@ -116,6 +117,9 @@ function guildState(client, guildId) {
       filters: new Set(),
       loop: false,
       player,
+      playInVoice: true,
+      nameSearchBusy: false,
+      lastNameSearchAt: 0,
       queue: [],
       resource: null,
       resourceStartSeconds: 0,
@@ -300,9 +304,10 @@ async function resolveTracks(query, requester) {
   if (!value) throw new Error("اكتب اسم الأغنية أو الرابط.");
   const soundCloudQuery = value.match(/^(?:sc|soundcloud|ساوندكلاود)\s+(.+)$/i)?.[1];
   if (soundCloudQuery) {
-    const tracks = await searchSoundCloud(soundCloudQuery, requester, 1);
-    if (!tracks.length) throw new Error("لم أجد الأغنية على SoundCloud.");
-    return tracks;
+    const tracks = await searchSoundCloud(soundCloudQuery, requester, 5);
+    const track = matchingSong(soundCloudQuery, tracks);
+    if (!track) throw new Error("لم أجد عنوانًا مطابقًا على SoundCloud. جرّب اسمًا أوضح أو رابط الأغنية.");
+    return [track];
   }
 
   if (/^https?:\/\//i.test(value)) {
@@ -335,15 +340,21 @@ async function resolveTracks(query, requester) {
     return [{ ...metadata, provider: providerFor(value), requester, url: value }];
   }
 
-  const results = await youtubeSearch(value, { limit: 1, source: { youtube: "video" } });
-  if (!results.length) throw new Error("لم أجد الأغنية. جرّب كلمات أوضح.");
+  const results = await youtubeSearch(value, { limit: 5, source: { youtube: "video" } }).catch(() => []);
+  const match = matchingSong(value, results);
+  if (!match) {
+    const alternatives = await searchSoundCloud(value, requester, 5);
+    const alternative = matchingSong(value, alternatives);
+    if (alternative) return [alternative];
+    throw new Error("لم أجد عنوانًا مطابقًا. اكتب كلمات إضافية من اسم الأغنية أو رابطها.");
+  }
   return [{
-    duration: results[0].durationRaw,
+    duration: match.durationRaw,
     provider: "YouTube",
     requester,
-    thumbnail: results[0].thumbnails?.at(-1)?.url,
-    title: results[0].title,
-    url: results[0].url
+    thumbnail: match.thumbnails?.at(-1)?.url,
+    title: match.title,
+    url: match.url
   }];
 }
 
@@ -641,7 +652,11 @@ async function enqueueTracks(client, context, data, tracks) {
 
 async function enqueue(client, message, data, query) {
   const tracks = await resolveTracks(query, message.author.id);
-  return enqueueTracks(client, {
+  return enqueueTracks(client, messageContext(message), data, tracks);
+}
+
+function messageContext(message) {
+  return {
     authorId: message.author.id,
     channel: message.channel,
     guild: message.guild,
@@ -649,14 +664,14 @@ async function enqueue(client, message, data, query) {
     messageId: message.id,
     acknowledge: (success) => message.react(success ? "✅" : "❌").catch(() => {}),
     reply: (payload) => message.reply(payload)
-  }, data, tracks);
+  };
 }
 
 function helpEmbed() {
   return new EmbedBuilder()
     .setColor(0x7c3aed)
     .setTitle("🎵 Music Fleet — الأوامر")
-    .setDescription("الأوامر تعمل فقط في شات الروم الصوتي اللي أنت والبوت فيه. للتشغيل اكتب ش ثم اسم الأغنية أو رابطها. الكلام العادي لا يشغّل أغاني. إذا الروم بدون بوت، اكتب join في شاته أولاً.")
+    .setDescription("داخل شات الروم الصوتي اللي أنت والبوت فيه: اكتب كلمة من اسم الأغنية أو عنوانها مباشرة، أو ش ثم الاسم/الرابط. البوت يشغّل نتيجة مطابقة للعنوان. إذا الروم بدون بوت، اكتب join في شاته أولاً.")
     .addFields(
       { name: "التشغيل", value: "`ش <اسم أو رابط>` أو `play <اسم أو رابط>` أو `شغل <اسم>`\nمثال: `ش اسم الأغنية`" },
       { name: "التحكم", value: "`queue` القائمة • `nowplaying` الحالي • `pause` إيقاف مؤقت • `resume` متابعة\n`skip` تخطي • `stop` إيقاف • `clear` مسح الانتظار • `leave` خروج" },
@@ -673,7 +688,7 @@ function settingsEmbed(client, data) {
     .setColor(0x7c3aed)
     .setTitle(`⚙️ إعدادات ${client.user.username}`)
     .addFields(
-      { name: "طريقة التشغيل", value: "`ش اسم الأغنية` أو `play اسم الأغنية` فقط؛ الكلام العادي يُتجاهل.", inline: false },
+      { name: "طريقة التشغيل", value: data.playInVoice ? "اكتب كلمة من اسم الأغنية أو العنوان مباشرة، أو `ش اسم الأغنية`." : "`ش اسم الأغنية` أو `play اسم الأغنية`؛ التشغيل بالعنوان المباشر متوقف.", inline: false },
       { name: "الروم الصوتي", value: channelId ? `<#${channelId}>` : "غير متصل", inline: true },
       { name: "الصوت", value: `${Math.round(data.volume * 100)}`, inline: true },
       { name: "التكرار", value: data.loop ? "✅" : "☑️", inline: true },
@@ -713,13 +728,25 @@ async function clearOldSlashCommands(client) {
 async function handleMessage(client, message) {
   if (message.author.bot || !message.guild) return;
   const parsed = parseInput(client, message);
-  if (!parsed.text || !parsed.command || !selected(client, message, parsed)) return;
+  if (!parsed.text || !selected(client, message, parsed)) return;
+  const directQuery = !parsed.command ? directSongQuery(parsed.text) : null;
+  if (!parsed.command && !directQuery) return;
 
   const data = guildState(client, message.guild.id);
   data.textChannel = message.channel;
   const command = parsed.command;
 
   try {
+    if (!command) {
+      if (!data.playInVoice || data.nameSearchBusy || Date.now() - data.lastNameSearchAt < 3000) return;
+      data.nameSearchBusy = true;
+      data.lastNameSearchAt = Date.now();
+      try {
+        const tracks = await resolveTracks(directQuery, message.author.id).catch(() => []);
+        if (!tracks.length) return;
+        return await enqueueTracks(client, messageContext(message), data, tracks);
+      } finally { data.nameSearchBusy = false; }
+    }
     if (command === "help") {
       try {
         await message.author.send({ embeds: [helpEmbed()] });
@@ -880,7 +907,10 @@ async function handleMessage(client, message) {
     }
     if (command === "playinvcall") {
       if (!isAdministrator(message)) return void message.reply("هذا الأمر للأدمن أو المالك فقط.");
-      return void message.reply("التشغيل بالرسائل العادية مُلغى. استخدم `ش اسم الأغنية` أو `play اسم الأغنية` داخل شات الروم الصوتي.");
+      const value = parsed.parts[0]?.toLowerCase();
+      if (!["on", "off", "تشغيل", "ايقاف", "إيقاف"].includes(value)) return void message.reply("استخدم `playinvcall on` لتفعيل التشغيل بالعنوان، أو `playinvcall off` للأوامر فقط.");
+      data.playInVoice = ["on", "تشغيل"].includes(value);
+      return void message.reply(data.playInVoice ? "✅ التشغيل بكلمة من اسم الأغنية أو عنوانها مفعّل." : "✅ التشغيل بالأوامر فقط. استخدم `ش اسم الأغنية`.");
     }
   } catch (error) {
     console.error(`[${client.user.tag}] command error:`, error.message);

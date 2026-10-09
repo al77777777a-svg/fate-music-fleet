@@ -15,6 +15,10 @@ async function main() {
     await new Promise((resolve) => setTimeout(resolve, 2000));
     if (player.state.status !== AudioPlayerStatus.Playing || process.exitCode) throw new Error("YouTube audio did not remain playable.");
     console.log("YOUTUBE_AUDIO_OK: decoded PCM and encoded Discord audio for 2 seconds.");
-  } finally { player.stop(true); source.stream.destroy(); }
+  } finally {
+    player.stop(true);
+    source.stream.destroy();
+    await new Promise((resolve) => setTimeout(resolve, 250));
+  }
 }
 main().then(() => process.exit(process.exitCode || 0)).catch((error) => { console.error("YOUTUBE_AUDIO_FAILED:", error.message); process.exit(1); });

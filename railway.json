@@ -1,8 +1,4 @@
 {
   "$schema": "https://railway.com/railway.schema.json",
-  "build": { "buildCommand": "npm run build" },
-  "deploy": {
-    "preDeployCommand": "npm run check:youtube",
-    "preDeployTimeoutSeconds": 90
-  }
+  "build": { "buildCommand": "npm run build" }
 }

@@ -16,8 +16,10 @@ async function main() {
     await entersState(player, AudioPlayerStatus.Playing, 15000);
     console.log("Audio decoded and encoded successfully; player status:", player.state.status);
   } finally {
-    player.stop();
+    player.stop(true);
     source.stream.destroy();
+    // Let encoder/FFmpeg close callbacks run before terminating the probe on Windows.
+    await new Promise((resolve) => setTimeout(resolve, 250));
   }
 }
 main().then(() => process.exit(process.exitCode || 0)).catch((error) => { console.error(error.message); process.exit(1); });
