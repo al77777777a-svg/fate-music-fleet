@@ -1,94 +1,67 @@
-# ربط التخزين الدائم والـ 24 ساعة بالبوت
+# تحديث البوت: 24/7 والأونرات والإعدادات مدمجة في index.js
 
-ما شفت كود `src` حقك، فهذي ملفات جاهزة تنحط جنبه. تحتاج تعدّل مكانين بس.
+الوحدات (`store` و`perms` و`stay247` و`settings`) صارت مربوطة بالبوت نفسه، مو ملفات جنبه.
 
-## الملفات
+## ارفع هذي الملفات (استبدل القديمة)
 
-| الملف | وش يسوي |
+| الملف | وين |
 |---|---|
-| `src/store.mjs` | تخزين دائم في ملف JSON (حفظ ذري، يتحمّل بعد restart) |
-| `src/perms.mjs` | مستويات الصلاحيات (الكل / أدمن / أونر / أونر كل البوتات) وأوامر `addowner` و`removeowner` و`ownerlist` و`addownerall` و`removeownerall` |
-| `src/settings.mjs` | `prefix` و`chat` و`settings` و`buttons` و`embed` و`playinvc` و`lang` و`platform` و`ecolor`، وأخواتها لكل البوتات: `buttonsall` و`embedall` و`playinvcall` و`langall` و`platformall` و`chatall` و`ecolorall` |
-| `src/stay247.mjs` | `come` و`leave` و`setup` و`comeall` و`setupall` و`checkchannelall`، مع رجوع البوت لرومه بعد restart أو لو انفصل |
-| `test/stay247.test.mjs` | 7 اختبارات، شغّلها بـ `node --test "test/*.test.mjs"` |
+| `index.js` | `src/` |
+| `room-routing.js` | `src/` |
+| `player-ui.js` | `src/` |
+| `stay247.mjs` | `src/` |
+| `command-only.test.js` | `test/` |
+| `room-routing.test.js` | `test/` |
+| `.gitignore` | الرئيسي |
+| `INTEGRATION.md` | الرئيسي (وتقدر تحذف النسخة اللي في `src/`) |
 
-الملفات بصيغة `.mjs`. تشتغل من ESM أو CommonJS على Node 22.12 وما فوق.
+## قبل ما تنشر على Railway
 
-## 1. Railway: لازم Volume
-
-بدون Volume ملف الإعدادات يضيع مع كل deploy.
-
-1. في خدمتك على Railway: Settings ← Volumes ← Add Volume، وخل مسار الـ mount هو `/data`.
+1. أضف **Volume** للخدمة، ومسار الـ mount `/data`.
 2. أضف المتغير `DATA_DIR=/data`.
-3. إذا شغّلت من جهازك بدل Railway، لا تحتاج شي، الملف ينحفظ في مجلد `data/` بجنب المشروع.
 
-## 2. إنشاء الوحدات (مرة وحدة، بعد ما تجهز كل الكلاينتات)
+بدون الـ Volume الإعدادات و24/7 تضيع مع كل deploy. وإذا شغّلت من جهازك، الملف ينحفظ في مجلد `data/` ولا يتحمّل على GitHub.
 
-```js
-import { store } from './store.mjs';
-import { createStay247 } from './stay247.mjs';
-import { createOwnerCommands } from './perms.mjs';
-import { createSettings, settingsOf, prefixOf, chatAllowed } from './settings.mjs';
+## وش تغيّر
 
-const clients = [/* كل كلاينتات الأسطول العشرة */];
-const stay = createStay247({ store, clients });
-const owners = createOwnerCommands({ store });
-const settings = createSettings({ store, clients });
+**أوامر جديدة** (الصلاحيات حسب دليل فيت ستور):
 
-for (const client of clients) stay.attach(client); // يرجّع البوت لرومه بعد restart
-```
+- **أدمن**: `come` و`afk` (تثبيت 24/7) و`leave` و`prefix` و`chat` و`settings`.
+- **أونر**: `setup` و`comeall` و`buttons` و`embed` و`lang` و`platform` و`ecolor` و`addowner` و`removeowner` و`ownerlist`.
+- **أونر كل البوتات**: `setupall` و`checkchannelall` و`addownerall` و`removeownerall` و`buttonsall` و`embedall` و`langall` و`platformall` و`chatall` و`ecolorall` و`playinvcall`.
 
-في CommonJS استخدم `const { store } = require('./store.mjs')` وبقية الاستيرادات بنفس الطريقة.
+**كيف تنوصل الأوامر**:
 
-## 3. الموجّه (router) حق الأوامر
+- أوامر الإدارة تشتغل بالمنشن من أي شات: `@البوت come`، و`@البوت prefix !`. صلاحيتك هي اللي تحكم، مو وجودك في الروم.
+- أوامر `*all` يرد عليها بوت واحد بس، أول بوت جاهز في السيرفر.
+- البادئة لكل بوت: الافتراضي رقمه (`1play`). `prefix !` يخليها `!play`، و`prefix none` تلغيها.
+- `chat #commands` يخلي شات نصي يقبل أوامر التشغيل، بشرط تكون داخل روم فيه بوت.
 
-في المكان اللي عندك يحدد البوت المخاطَب ويفصل الأمر عن البادئة أو المنشن، أضف قبل بقية الأوامر:
+**الإعدادات اللي تأثر فعلاً**:
 
-```js
-if (await stay.handle({ client, message, command, args })) return;
-if (await owners.handle({ client, message, command, args })) return;
-if (await settings.handle({ client, message, command, args })) return;
-```
+- `platform soundcloud`: البحث بالاسم يبدأ من SoundCloud.
+- `playinvc` و`playinvcall`: التشغيل بكتابة اسم الأغنية.
+- `embed`: رد التشغيل يطلع كرت.
+- `buttons`: أزرار التحكم تحت رد التشغيل.
+- `ecolor`: لون الكرت.
 
-- `command` بدون بادئة ومنشن (مثلاً `come`)، و`args` مصفوفة الكلمات بعده.
-- `client` هو البوت اللي استلم الرسالة، يعني `message.client`.
-- ما سجّلت `join` كاختصار لـ `come` لأنه عندك مستخدم لاستدعاء بوت متاح.
+**الرجوع التلقائي**: البوت المثبّت يرجع لرومه بعد restart، وإذا انفصل يرجع بعد 3 ثواني.
 
-## 4. ربط الإعدادات بكودك الحالي
+## تغييرات في السلوك القديم
 
-الوحدة تخزّن الإعدادات بس، وكودك هو اللي يقراها. ثلاث نقاط:
+- `leave` و`settings` صارت للأدمن فقط (كانت لأي عضو في الروم).
+- `come` و`afk` صارت تثبيت 24/7 للأدمن. أما `join` و`تعال` فتظل استدعاء مؤقت للجميع.
+- `playinvcall` صار يطبّق على كل البوتات ويبقى بعد restart، وكان لبوت واحد بالذاكرة.
+- خطأ `Got 404 from the request` اللي ظهر عندك: فشل بحث SoundCloud ما عاد يوقف الأمر، وإذا فشلت المصادر كلها تطلع رسالة واضحة فيها سبب الفشل.
 
-```js
-// البادئة: رقم البوت (0، 1، 2…) إلى أن يغيّرها الأدمن، و none تشيلها
-const prefix = prefixOf(store, guild.id, client.user.id, botIndex);
+## ما انعمل بعد
 
-// شات الأوامر: تجاهل الرسالة إذا رجّعت false
-if (!chatAllowed(store, message, client.user.id)) return;
+- `lang` يتخزّن لكن الردود كلها عربي حالياً.
+- لوحات `#mp` و`@bot vip`، وأوامر `avatarall` و`nameall` و`gameall` و`statusall`، و`dash`، و`restartall`، و`settempall`.
+- يوتيوب على Railway: عنوان السيرفر محجوب من YouTube، والحل تشغيل البوتات من جهاز بعنوان بيتي. ولحد ذلك خل `platformall soundcloud`.
 
-// المنصة والإمبد والأزرار والتشغيل بالروم واللغة
-const { platform, embed, buttons, playinvc, lang, ecolor } = settingsOf(store, guild.id, client.user.id);
-```
+## كيف جرّبت
 
-- `platform` قيمته `youtube` أو `soundcloud`: استخدمه في البحث بالاسم.
-- `playinvc` يتحكم في "اكتب اسم الأغنية مباشرة". الافتراضي `true` عشان يبقى مثل سلوكك الحالي، و`playinvcall off` يطفيه.
-- `embed` و`buttons` و`ecolor` و`lang` لازم يقراها كود الردود عندك لتغيّر شكله، ما أقدر أربطها بدون ما أشوفه.
-
-## ملاحظات مهمة
-
-- **الاتصال الصوتي**: الافتراضي يستخدم `@discordjs/voice` مع `group = ايدي البوت`. إذا كودك عنده مدير اتصالات ومشغّلات صوت خاص فيه، مرّر دوالك: `createStay247({ store, clients, join: (client, channel) => ..., leave: (client, guildId) => ... })`، وإلا بيصير عندك اتصالين لنفس البوت في السيرفر.
-- **setup** يغيّر اسم البوت في السيرفر (Nickname) مو الاسم العام، عشان ما يصطدم بحد ديسكورد على تغيير الاسم. يحتاج البوت صلاحية Change Nickname، وإذا ما قدر يظل مثبّت في الروم عادي.
-- **الرجوع التلقائي**: لو انفصل البوت من الروم (مو بأمر `leave`) يرجع بعد 3 ثواني، وأقصى 5 محاولات في الدقيقة. لو أحد سحبه لروم ثاني ما يرجّعه.
-- **comeall و setupall**: يدخّلون البوتات بفاصل 400ms بينها عشان ما يضربون حدود الـ gateway.
-- **الأونرات**: `OWNER_IDS` عندك تصير "صاحب الاشتراك" وهو أونر لكل البوتات. مستويات الأوامر: `come` و`leave` للأدمن، و`setup` و`comeall` للأونر، و`setupall` و`checkchannelall` لأونر كل البوتات.
-
-## اللي ما سويته بعد
-
-مشكلة يوتيوب على Railway (شرحها تحت)، ولوحات `#mp` و`@bot vip` والأزرار، وأوامر الشكل (`avatarall` و`nameall` و`gameall`)، و`dash`. أغلبها يعتمد على نفس التخزين، فبعد ما تتأكد إن هذا الجزء يشتغل نكمل عليه.
-
-## يوتيوب
-
-الكود ما يقدر يحل `LOGIN_REQUIRED` من Railway، لأن YouTube يرفض عناوين مراكز البيانات نفسها. المحرك اللي حدّثتوه شغّال أصلاً عندك محلياً.
-
-- **الحل اللي يشتغل**: شغّل البوتات من جهاز بعنوان بيتي (جهازك أو ميني PC)، وأوقف نسخة Railway حتى ما يشتغل كل بوت مرتين.
-- **على Railway**: خل `platform` على `soundcloud`، وكل بوت ينفع يتحدد له بـ `platformall soundcloud`.
-- الأوامر والإعدادات في هذي الملفات تشتغل بنفس الطريقة في الحالتين.
+- 37 اختبار وحدة نجحت، منها اختبارات جديدة لمسار الإدارة والبادئات وشات الأوامر.
+- شغّلت `index.js` الحقيقي بمكتبات ديسكورد وهمية وأرسلت له رسائل مزيفة: `come` و`leave` و`comeall` و`setupall` و`prefix`، وإعادة تشغيل العملية ورجوع البوتات لرومها.
+- ما جرّبته على ديسكورد الحقيقي. أول ما تنشر، جرّب `come` في روم، ثم أعد النشر من Railway وشوف إن البوت يرجع لرومه.
