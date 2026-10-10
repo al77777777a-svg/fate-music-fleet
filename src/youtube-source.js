@@ -30,9 +30,32 @@ function sourceError(error) {
   }
   if (/private video|video is unavailable|video unavailable|removed|not available in your country/i.test(diagnostic)) return new Error("مقطع YouTube غير متاح أو خاص.");
   if (error.code === "ENOENT") return new Error("محرّك YouTube غير مثبّت؛ أعد تثبيت تبعيات المشروع.");
-  if (error.killed || error.code === "ETIMEDOUT") return new Error("انتهت مهلة الاتصال بـYouTube. جرّب لاحقًا.");
+  if (error.killed || error.code === "ETIMEDOUT") return Object.assign(new Error("انتهت مهلة الاتصال بـYouTube. جرّب لاحقًا."), { code: "YOUTUBE_SOURCE_FAILED" });
   // Never expose signed media URLs, response bodies or subprocess command lines in Discord/logs.
-  return new Error("تعذر الحصول على صوت YouTube من هذا الخادم.");
+  return Object.assign(new Error("تعذر الحصول على صوت YouTube من هذا الخادم."), { code: "YOUTUBE_SOURCE_FAILED" });
+}
+
+// The decoder (ffmpeg / yt-dlp pipe) failed: turn its stderr into a safe, classified error.
+function mediaError(diagnostic = "") {
+  const text = String(diagnostic);
+  const status = text.match(/(?:HTTP error|HTTP Error|Server returned) (\d{3})/i)?.[1];
+  const reason = text.replace(/https?:\/\/\S+/g, "<url>").replace(/\s+/g, " ").trim().slice(-160);
+  const denied = status === "403" || /sign in to confirm|not a bot|LOGIN_REQUIRED/i.test(text);
+  const error = denied
+    ? Object.assign(new Error(`YouTube رفض بث الصوت لهذا الخادم (${status || "تسجيل دخول"}).`), { code: "YOUTUBE_ACCESS_REQUIRED" })
+    : Object.assign(new Error(status ? `YouTube رد بخطأ ${status} أثناء بث الصوت.` : "لم يصل صوت قابل للتشغيل من YouTube."), { code: "YOUTUBE_SOURCE_FAILED" });
+  return Object.assign(error, { httpStatus: status, reason });
+}
+
+// Send the headers yt-dlp says the media URL needs (User-Agent etc.). Never cookies or auth.
+function ffmpegHeaders(raw) {
+  if (!raw || typeof raw !== "object") return [];
+  const entries = Object.entries(raw).filter(([key, value]) =>
+    /^[A-Za-z][A-Za-z0-9-]*$/.test(key) && typeof value === "string" && value && !/[\r\n]/.test(value) &&
+    !/^(host|cookie|authorization|range|connection|content-length)$/i.test(key));
+  const agent = entries.find(([key]) => key.toLowerCase() === "user-agent");
+  const rest = entries.filter(([key]) => key.toLowerCase() !== "user-agent");
+  return [...(agent ? ["-user_agent", agent[1]] : []), ...(rest.length ? ["-headers", rest.map(([key, value]) => `${key}: ${value}\r\n`).join("")] : [])];
 }
 
 async function resolveYouTube(input, run = runFile) {
@@ -55,28 +78,34 @@ async function resolveYouTube(input, run = runFile) {
   return metadata;
 }
 
-async function streamYouTube(track, startAt = 0, dependencies = {}) {
-  if (!Number.isFinite(startAt) || startAt < 0) throw new Error("وقت التشغيل غير صالح.");
-  const metadata = await (dependencies.resolve || resolveYouTube)(track.url);
-  const ffmpeg = dependencies.ffmpeg || require("ffmpeg-static");
-  if (!ffmpeg) throw new Error("FFmpeg غير متاح.");
-  const processAudio = (dependencies.spawn || spawn)(ffmpeg, [
-    "-hide_banner", "-loglevel", "error", "-nostdin", "-rw_timeout", "15000000",
-    ...(startAt ? ["-ss", String(startAt)] : []), "-i", metadata.url,
-    "-vn", "-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1"
-  ], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true, env: childEnvironment() });
-  const stream = processAudio.stdout;
-  processAudio.stderr.resume();
-  const stop = () => { if (!processAudio.killed) processAudio.kill(); };
+// Starts a decoder process and resolves once real PCM audio is flowing.
+// `upstream` (optional) is a yt-dlp process whose stdout is piped into the decoder.
+function startDecoder({ spawnFn, command, args, timeoutMs, upstream }) {
+  const decoder = spawnFn(command, args, { stdio: [upstream ? "pipe" : "ignore", "pipe", "pipe"], windowsHide: true, env: childEnvironment() });
+  let diagnostic = "";
+  const note = (chunk) => { diagnostic = (diagnostic + chunk).slice(-2000); };
+  decoder.stderr.on("data", note);
+  if (upstream) {
+    upstream.stderr.on("data", note);
+    upstream.stdout.on("error", () => {});
+    decoder.stdin.on("error", () => {});
+    upstream.stdout.pipe(decoder.stdin);
+  }
+  const stream = decoder.stdout;
+  const stop = () => {
+    if (!decoder.killed) decoder.kill();
+    if (upstream && !upstream.killed) upstream.kill();
+  };
   stream.once("close", stop);
-  processAudio.on("error", () => stream.destroy(new Error("تعذر بدء فك صوت YouTube.")));
-  processAudio.once("close", (code) => {
+  decoder.on("error", () => stream.destroy(new Error("تعذر بدء فك صوت YouTube.")));
+  decoder.once("close", (code) => {
     if (code && !stream.destroyed) stream.destroy(new Error("توقف بث صوت YouTube قبل اكتماله."));
   });
   // Keep an error listener after the readiness check; the Discord resource adds its own later.
   stream.on("error", stop);
-  await new Promise((resolve, reject) => {
-    const timer = setTimeout(() => fail(new Error("انتهت مهلة بدء صوت YouTube.")), dependencies.timeoutMs || 20000);
+  return new Promise((resolve, reject) => {
+    let settled = false;
+    const timer = setTimeout(() => fail(new Error("انتهت مهلة بدء صوت YouTube.")), timeoutMs);
     const cleanup = () => {
       clearTimeout(timer);
       stream.off("readable", ready);
@@ -84,19 +113,67 @@ async function streamYouTube(track, startAt = 0, dependencies = {}) {
       stream.off("end", ended);
       stream.off("close", ended);
     };
-    const fail = (error) => { cleanup(); stream.destroy(); stop(); reject(error); };
-    const ended = () => fail(new Error("لم يصل صوت قابل للتشغيل من YouTube."));
-    const ready = () => { if (stream.readableLength > 0) { cleanup(); resolve(); } };
+    const fail = (error) => {
+      if (settled) return;
+      settled = true;
+      cleanup();
+      stream.destroy();
+      stop();
+      reject(error);
+    };
+    // Give stderr a moment to arrive so the failure reason (403, 404…) is known.
+    const ended = () => setTimeout(() => fail(mediaError(diagnostic)), 120);
+    const ready = () => { if (!settled && stream.readableLength > 0) { settled = true; cleanup(); resolve(stream); } };
     stream.on("readable", ready);
     stream.once("error", fail);
     stream.once("end", ended);
     stream.once("close", ended);
     ready();
   });
+}
+
+const PIPE_ARGS = [
+  "--ignore-config", "--no-plugin-dirs", "--no-cache-dir", "--no-playlist", "--no-progress", "--quiet", "--no-warnings",
+  "--js-runtimes", `node:${process.execPath}`, "--no-remote-components",
+  "--socket-timeout", "10", "--retries", "2", "-f", "bestaudio[ext=webm]/bestaudio", "-o", "-"
+];
+
+async function streamYouTube(track, startAt = 0, dependencies = {}) {
+  if (!Number.isFinite(startAt) || startAt < 0) throw new Error("وقت التشغيل غير صالح.");
+  const metadata = await (dependencies.resolve || resolveYouTube)(track.url);
+  const ffmpeg = dependencies.ffmpeg || require("ffmpeg-static");
+  if (!ffmpeg) throw new Error("FFmpeg غير متاح.");
+  const spawnFn = dependencies.spawn || spawn;
+  const timeoutMs = dependencies.timeoutMs || 20000;
+  const seek = startAt ? ["-ss", String(startAt)] : [];
+  const output = ["-vn", "-f", "s16le", "-ar", "48000", "-ac", "2", "pipe:1"];
+
+  let stream;
+  try {
+    // 1) ffmpeg reads the media URL directly, with the headers yt-dlp asked for.
+    stream = await startDecoder({
+      spawnFn, command: ffmpeg, timeoutMs,
+      args: ["-hide_banner", "-loglevel", "error", "-nostdin", "-rw_timeout", "15000000", ...seek, ...ffmpegHeaders(metadata.http_headers), "-i", metadata.url, ...output]
+    });
+  } catch (error) {
+    if (!error.httpStatus || dependencies.pipe === false) throw error;
+    try {
+      // 2) The media server refused ffmpeg: let yt-dlp download it (same headers, chunking, retries) and pipe it in.
+      const upstream = spawnFn(executable, [...PIPE_ARGS, "--", youtubeUrl(track.url)], { stdio: ["ignore", "pipe", "pipe"], windowsHide: true, env: childEnvironment() });
+      upstream.on("error", () => {});
+      stream = await startDecoder({
+        spawnFn, command: ffmpeg, timeoutMs, upstream,
+        args: ["-hide_banner", "-loglevel", "error", ...seek, "-i", "pipe:0", ...output]
+      });
+    } catch (second) {
+      error.reason = `${error.reason} | pipe: ${second.reason || second.message}`.slice(0, 300);
+      throw error;
+    }
+  }
   if (metadata.title) track.title = metadata.title;
   if (metadata.thumbnail) track.thumbnail = metadata.thumbnail;
   if (metadata.duration) track.duration = `${Math.floor(metadata.duration / 60)}:${String(Math.floor(metadata.duration % 60)).padStart(2, "0")}`;
   return { stream, type: StreamType.Raw };
 }
 
-module.exports = { childEnvironment, youtubeUrl, sourceError, resolveYouTube, streamYouTube };
+module.exports = { childEnvironment, youtubeUrl, sourceError, mediaError, ffmpegHeaders, resolveYouTube, streamYouTube };

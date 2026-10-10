@@ -4,9 +4,13 @@ const { streamYouTube } = require("./youtube-source");
 let soundCloudReady;
 let youtubeBlockedUntil = 0;
 
+// YouTube refused this server (login wall or media 403): block YouTube for a while and use SoundCloud.
 function isYouTubeBlocked(error) {
-  return /sign in to confirm|not a bot|LOGIN_REQUIRED/i.test(String(error?.message || error));
+  return error?.code === "YOUTUBE_ACCESS_REQUIRED" || /sign in to confirm|not a bot|LOGIN_REQUIRED/i.test(String(error?.message || error));
 }
+
+// Any other failure to get audio from YouTube (timeout, no audio, 404…): fall back for this track only.
+const isYouTubeSourceFailure = (error) => error?.code === "YOUTUBE_SOURCE_FAILED";
 
 async function ensureSoundCloud() {
   if (!soundCloudReady) {
@@ -93,8 +97,9 @@ async function streamTrack(track, startAt = 0) {
     if (!isSoundCloud) return await streamYouTube(track, startAt);
     return await play.stream(track.url, { quality: 2, discordPlayerCompatibility: startAt === 0, ...(startAt ? { seek: startAt } : {}) });
   } catch (error) {
-    if (isSoundCloud || !isYouTubeBlocked(error) || startAt) throw error;
-    youtubeBlockedUntil = Date.now() + 300_000;
+    const blocked = isYouTubeBlocked(error);
+    if (isSoundCloud || startAt || !(blocked || isYouTubeSourceFailure(error))) throw error;
+    if (blocked) youtubeBlockedUntil = Date.now() + 300_000;
     await ensureSoundCloud();
     for (const query of queryVariants(track.title)) {
       const candidates = await play.search(query, { limit: 5, source: { soundcloud: "tracks" } });
@@ -105,7 +110,9 @@ async function streamTrack(track, startAt = 0) {
       Object.assign(track, soundCloudTrack(match, track.requester), { fallbackFrom: originalUrl });
       return source;
     }
-    throw new Error("YouTube يرفض التشغيل من خادم Railway حاليًا، ولم أجد نسخة مطابقة على SoundCloud. جرّب رابط SoundCloud أو اكتب: play sc اسم الأغنية.");
+    throw new Error(blocked
+      ? "YouTube يرفض التشغيل من خادم Railway حاليًا، ولم أجد نسخة مطابقة على SoundCloud. جرّب رابط SoundCloud أو اكتب: play sc اسم الأغنية."
+      : "تعذر تشغيل YouTube من هذا الخادم الحين، ولم أجد نسخة مطابقة على SoundCloud. جرّب رابط SoundCloud أو اكتب: play sc اسم الأغنية.");
   }
 }
 
